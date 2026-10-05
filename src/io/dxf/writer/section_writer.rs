@@ -204,16 +204,15 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
         self.loft_input_entities.clear();
         for entity in &document.entities {
-            let EntityType::Surface(Surface {
-                surface_data:
-                    SurfaceData::Lofted {
-                        cross_sections,
-                        guide_curves,
-                        path_curve,
-                        ..
-                    },
+            let EntityType::Surface(surface) = entity.as_ref() else {
+                continue;
+            };
+            let SurfaceData::Lofted {
+                cross_sections,
+                guide_curves,
+                path_curve,
                 ..
-            }) = entity.as_ref()
+            } = &surface.surface_data
             else {
                 continue;
             };
@@ -1941,17 +1940,20 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 | EntityType::AttributeEntity(_)
                 | EntityType::Unknown(_)
         ) {
-            if let EntityType::Surface(Surface {
-                surface_data:
+            // (Surface is boxed inside EntityType: destructure in two steps.)
+            let lofted = match entity {
+                EntityType::Surface(surface) => match &surface.surface_data {
                     SurfaceData::Lofted {
                         cross_sections,
                         guide_curves,
                         path_curve,
                         ..
-                    },
-                ..
-            }) = entity
-            {
+                    } => Some((cross_sections, guide_curves, path_curve)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((cross_sections, guide_curves, path_curve)) = lofted {
                 let mut data = entity.common().extended_data.clone();
                 data.remove_record("CADCODEC_LOFT_REFERENCES");
                 if !cross_sections.is_empty() || !guide_curves.is_empty() || path_curve.is_some() {

@@ -69,6 +69,41 @@ impl UnknownEntity {
             dwg_source_version: None,
         }
     }
+
+    /// Proxy graphics of this entity (e.g. Civil 3D `AECC_COGO_POINT`).
+    ///
+    /// DWG: the graphics blob is stored in `common.graphic_data`.
+    /// DXF: it arrives as group-code 310 hex chunks inside `raw_dxf_codes`
+    /// (proxy entity data may follow it, so the blob is cut to the size
+    /// declared in its own header before decoding).
+    pub fn proxy_graphics(&self) -> Option<crate::entities::ProxyGraphics> {
+        if let Some(g) = self.common.proxy_graphics() {
+            return Some(g);
+        }
+        let codes = self.raw_dxf_codes.as_ref()?;
+        let mut bytes: Vec<u8> = Vec::new();
+        for (code, value) in codes {
+            if *code != 310 {
+                continue;
+            }
+            let v = value.trim().as_bytes();
+            let mut i = 0;
+            while i + 1 < v.len() {
+                let hi = (v[i] as char).to_digit(16)?;
+                let lo = (v[i + 1] as char).to_digit(16)?;
+                bytes.push((hi * 16 + lo) as u8);
+                i += 2;
+            }
+        }
+        if bytes.len() < 8 {
+            return None;
+        }
+        let total = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if total < 8 || total > bytes.len() {
+            return None;
+        }
+        crate::entities::ProxyGraphics::decode(&bytes[..total])
+    }
 }
 
 impl Entity for UnknownEntity {

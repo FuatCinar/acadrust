@@ -2911,7 +2911,7 @@ impl CadDocument {
     /// use acadrust::entities::{Viewport, EntityType};
     ///
     /// let vp = Viewport::new();
-    /// document.add_entity_to_layout(EntityType::Viewport(vp), "Layout1")?;
+    /// document.add_entity_to_layout(EntityType::Viewport(Box::new(vp)), "Layout1")?;
     /// ```
     pub fn add_entity_to_layout(
         &mut self,
@@ -3065,7 +3065,7 @@ impl CadDocument {
     /// ```ignore
     /// let layout_handle = document.add_layout("Layout2")?;
     /// // Then add entities to it:
-    /// document.add_entity_to_layout(EntityType::Viewport(vp), "Layout2")?;
+    /// document.add_entity_to_layout(EntityType::Viewport(Box::new(vp)), "Layout2")?;
     /// ```
     pub fn add_layout(&mut self, name: &str) -> Result<Handle> {
         // Check for duplicate layout name
@@ -3131,7 +3131,7 @@ impl CadDocument {
         self.record_entity_before(overall_vp_handle, None);
         let idx = self.entities.len();
         self.entities
-            .push(Arc::new(EntityType::Viewport(overall_vp)));
+            .push(Arc::new(EntityType::Viewport(Box::new(overall_vp))));
         self.entity_index.insert(overall_vp_handle, idx);
 
         // Register in ACAD_LAYOUT dictionary
@@ -3154,6 +3154,14 @@ impl CadDocument {
     /// definitions and are emitted from block records, not the entity list.
     pub fn entity_count(&self) -> usize {
         self.entities().count()
+    }
+
+    /// O(1) length of the backing entity vector (includes Block/BlockEnd markers).
+    /// Used by the DXF reader for cheap per-entity deltas instead of the O(n)
+    /// `entities().count()`, which made ENTITIES parsing quadratic.
+    #[inline]
+    pub(crate) fn raw_entity_len(&self) -> usize {
+        self.entities.len()
     }
 
     /// Iterate over all drawing entities.
@@ -3223,6 +3231,69 @@ impl CadDocument {
     /// excluded, matching what CAD applications render by default (issue #52).
     pub fn model_space_entities(&self) -> impl Iterator<Item = &EntityType> + '_ {
         self.entities_in_block("*Model_Space")
+    }
+
+    /// Resolve the block-record name backing a named [`Layout`](crate::objects::Layout)
+    /// object (e.g. `"Model"`, `"Layout1"`, `"Layout2"`).
+    ///
+    /// Returns `None` if no Layout with that name exists, or its
+    /// `block_record` handle doesn't resolve to a real block record.
+    pub fn layout_block_name(&self, layout_name: &str) -> Option<String> {
+        let block_handle = self.objects.values().find_map(|obj| match obj {
+            ObjectType::Layout(layout) if layout.name == layout_name => Some(layout.block_record),
+            _ => None,
+        })?;
+        self.block_records
+            .iter()
+            .find(|br| br.handle == block_handle)
+            .map(|br| br.name().to_string())
+    }
+
+    /// Iterate over the entities drawn directly on a named layout's sheet —
+    /// title block, notes, dimensions, and the VIEWPORT entities themselves.
+    ///
+    /// This does **not** include the model-space geometry shown *through* a
+    /// viewport (see [`viewports_in_layout`](Self::viewports_in_layout));
+    /// consumers that render a paper-space layout need to additionally
+    /// transform and draw the model-space entities visible through each of
+    /// that layout's viewports.
+    ///
+    /// Returns `None` if `layout_name` doesn't match any Layout object, so
+    /// callers can fall back to [`model_space_entities`](Self::model_space_entities)
+    /// rather than showing a blank drawing.
+    pub fn entities_in_layout<'a>(
+        &'a self,
+        layout_name: &str,
+    ) -> Option<impl Iterator<Item = &'a EntityType> + 'a> {
+        let block_name = self.layout_block_name(layout_name)?;
+        Some(self.entities_in_block(&block_name))
+    }
+
+    /// List the VIEWPORT entities that belong to a named layout, excluding
+    /// the implicit `id == 1` "paper background" pseudo-viewport that every
+    /// paper-space layout has (it represents the sheet itself, not a window
+    /// into model space, and AutoCAD never draws model geometry through it).
+    ///
+    /// Returns an empty `Vec` if the layout doesn't exist or has no
+    /// (real) viewports.
+    pub fn viewports_in_layout<'a>(&'a self, layout_name: &str) -> Vec<&'a crate::entities::Viewport> {
+        let Some(block_name) = self.layout_block_name(layout_name) else {
+            return Vec::new();
+        };
+        let mut all: Vec<&'a crate::entities::Viewport> = self
+            .entities_in_block(&block_name)
+            .filter_map(|e| match e {
+                EntityType::Viewport(vp) => Some(&**vp),
+                _ => None,
+            })
+            .collect();
+        if all.iter().any(|v| v.id == 1) {
+            all.retain(|v| v.id != 1);
+        } else if all.len() > 1 && all.iter().all(|v| v.id == 0) {
+            all.sort_by_key(|v| v.common.handle.value());
+            all.remove(0);
+        }
+        all
     }
 
     /// Owner handle of a database object, for ownership-chain walks.

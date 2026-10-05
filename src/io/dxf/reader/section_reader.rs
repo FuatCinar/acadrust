@@ -2984,7 +2984,8 @@ impl<'a> SectionReader<'a> {
                 // Read table name (code 2)
                 if let Some(name_pair) = self.reader.read_pair()? {
                     if name_pair.code == 2 {
-                        match name_pair.value_string.as_str() {
+                        let table_name = name_pair.value_string.clone();
+                        match table_name.as_str() {
                             "LAYER" => self.read_layer_table(document)?,
                             "LTYPE" => self.read_linetype_table(document)?,
                             "STYLE" => self.read_textstyle_table(document)?,
@@ -3009,6 +3010,7 @@ impl<'a> SectionReader<'a> {
 
     /// Read the BLOCKS section
     pub fn read_blocks(&mut self, document: &mut CadDocument) -> Result<()> {
+
         // Read blocks until ENDSEC
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 && pair.value_string == "ENDSEC" {
@@ -3020,6 +3022,7 @@ impl<'a> SectionReader<'a> {
                 if self.read_block(document)? {
                     self.decoded_records = self.decoded_records.saturating_add(1);
                 }
+
             }
         }
 
@@ -3240,17 +3243,17 @@ impl<'a> SectionReader<'a> {
                     }
                     "HELIX" => {
                         if let Some(entity) = self.read_helix()? {
-                            block_entities.push(EntityType::Helix(entity));
+                            block_entities.push(EntityType::Helix(Box::new(entity)));
                         }
                     }
                     "DIMENSION" => {
                         if let Some(entity) = self.read_dimension()? {
-                            block_entities.push(EntityType::Dimension(entity));
+                            block_entities.push(EntityType::Dimension(Box::new(entity)));
                         }
                     }
                     "ARC_DIMENSION" | "LARGE_RADIAL_DIMENSION" => {
                         if let Some(entity) = self.read_extended_dimension(&pair.value_string)? {
-                            block_entities.push(EntityType::Dimension(entity));
+                            block_entities.push(EntityType::Dimension(Box::new(entity)));
                         }
                     }
                     "HATCH" => {
@@ -3321,7 +3324,7 @@ impl<'a> SectionReader<'a> {
                     }
                     "VIEWPORT" => {
                         if let Some(entity) = self.read_viewport()? {
-                            block_entities.push(EntityType::Viewport(entity));
+                            block_entities.push(EntityType::Viewport(Box::new(entity)));
                         }
                     }
                     "LEADER" => {
@@ -3331,7 +3334,7 @@ impl<'a> SectionReader<'a> {
                     }
                     "MULTILEADER" | "MLEADER" => {
                         if let Some(entity) = self.read_multileader()? {
-                            block_entities.push(EntityType::MultiLeader(entity));
+                            block_entities.push(EntityType::MultiLeader(Box::new(entity)));
                         }
                     }
                     "MLINE" => {
@@ -3366,7 +3369,7 @@ impl<'a> SectionReader<'a> {
                     }
                     "ACAD_TABLE" | "TABLE" => {
                         if let Some(entity) = self.read_table_entity()? {
-                            block_entities.push(EntityType::Table(entity));
+                            block_entities.push(EntityType::Table(Box::new(entity)));
                         }
                     }
                     "PDFUNDERLAY" | "DWFUNDERLAY" | "DGNUNDERLAY" => {
@@ -3424,7 +3427,7 @@ impl<'a> SectionReader<'a> {
                     | "BLOCKANGULARCONSTRAINTPARAMETERENTITY"
                     | "XYPARAMETERENTITY" => {
                         if let Some(entity) = self.read_extended_entity(&pair.value_string)? {
-                            block_entities.push(EntityType::Extended(entity));
+                            block_entities.push(EntityType::Extended(Box::new(entity)));
                         }
                     }
                     "SEQEND" => {
@@ -3480,6 +3483,7 @@ impl<'a> SectionReader<'a> {
 
     /// Read the ENTITIES section
     pub fn read_entities(&mut self, document: &mut CadDocument) -> Result<()> {
+
         // Read entities until ENDSEC
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 && pair.value_string == "ENDSEC" {
@@ -3489,7 +3493,8 @@ impl<'a> SectionReader<'a> {
             // Entities start with code 0
             if pair.code == 0 {
                 let entity_type = pair.value_string.clone();
-                let before = document.entities().count();
+                let before = document.raw_entity_len();
+
 
                 match entity_type.as_str() {
                     "POINT" => {
@@ -3544,17 +3549,17 @@ impl<'a> SectionReader<'a> {
                     }
                     "HELIX" => {
                         if let Some(entity) = self.read_helix()? {
-                            let _ = document.add_entity(EntityType::Helix(entity));
+                            let _ = document.add_entity(EntityType::Helix(Box::new(entity)));
                         }
                     }
                     "DIMENSION" => {
                         if let Some(entity) = self.read_dimension()? {
-                            let _ = document.add_entity(EntityType::Dimension(entity));
+                            let _ = document.add_entity(EntityType::Dimension(Box::new(entity)));
                         }
                     }
                     "ARC_DIMENSION" | "LARGE_RADIAL_DIMENSION" => {
                         if let Some(entity) = self.read_extended_dimension(&entity_type)? {
-                            let _ = document.add_entity(EntityType::Dimension(entity));
+                            let _ = document.add_entity(EntityType::Dimension(Box::new(entity)));
                         }
                     }
                     "HATCH" => {
@@ -3620,7 +3625,7 @@ impl<'a> SectionReader<'a> {
                     }
                     "VIEWPORT" => {
                         if let Some(entity) = self.read_viewport()? {
-                            let _ = document.add_entity(EntityType::Viewport(entity));
+                            let _ = document.add_entity(EntityType::Viewport(Box::new(entity)));
                         }
                     }
                     "ATTRIB" => {
@@ -3635,7 +3640,7 @@ impl<'a> SectionReader<'a> {
                     }
                     "MULTILEADER" | "MLEADER" => {
                         if let Some(entity) = self.read_multileader()? {
-                            let _ = document.add_entity(EntityType::MultiLeader(entity));
+                            let _ = document.add_entity(EntityType::MultiLeader(Box::new(entity)));
                         }
                     }
                     "MLINE" => {
@@ -3670,7 +3675,7 @@ impl<'a> SectionReader<'a> {
                     }
                     "LIGHT" => {
                         if let Some(entity) = self.read_light_entity()? {
-                            let _ = document.add_entity(EntityType::Light(entity));
+                            let _ = document.add_entity(EntityType::Light(Box::new(entity)));
                         }
                     }
                     "SURFACE" | "PLANESURFACE" | "EXTRUDEDSURFACE" | "LOFTEDSURFACE"
@@ -3678,12 +3683,12 @@ impl<'a> SectionReader<'a> {
                         if let Some(entity) =
                             self.read_surface_entity(&entity_type, document.version)?
                         {
-                            let _ = document.add_entity(EntityType::Surface(entity));
+                            let _ = document.add_entity(EntityType::Surface(Box::new(entity)));
                         }
                     }
                     "ACAD_TABLE" | "TABLE" => {
                         if let Some(entity) = self.read_table_entity()? {
-                            let _ = document.add_entity(EntityType::Table(entity));
+                            let _ = document.add_entity(EntityType::Table(Box::new(entity)));
                         }
                     }
                     "PDFUNDERLAY" | "DWFUNDERLAY" | "DGNUNDERLAY" => {
@@ -3733,12 +3738,12 @@ impl<'a> SectionReader<'a> {
                     | "BLOCKANGULARCONSTRAINTPARAMETERENTITY"
                     | "XYPARAMETERENTITY" => {
                         if let Some(entity) = self.read_extended_entity(&entity_type)? {
-                            let _ = document.add_entity(EntityType::Extended(entity));
+                            let _ = document.add_entity(EntityType::Extended(Box::new(entity)));
                         }
                     }
                     name if is_registered_class_entity_name(name) => {
                         let entity = self.read_registered_class_entity(name)?;
-                        let _ = document.add_entity(EntityType::Extended(entity));
+                        let _ = document.add_entity(EntityType::Extended(Box::new(entity)));
                     }
                     "SEQEND" => {
                         // Standalone SEQEND — skip (normally consumed by polyline/insert reader)
@@ -3759,7 +3764,7 @@ impl<'a> SectionReader<'a> {
                 }
                 self.decoded_records = self
                     .decoded_records
-                    .saturating_add(document.entities().count().saturating_sub(before));
+                    .saturating_add(document.raw_entity_len().saturating_sub(before));
             }
         }
 
@@ -6248,6 +6253,7 @@ impl<'a> SectionReader<'a> {
         // orphaned dictionary entries.
         document.objects.clear();
 
+
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 && pair.value_string == "ENDSEC" {
                 break;
@@ -6255,6 +6261,8 @@ impl<'a> SectionReader<'a> {
 
             if pair.code == 0 {
                 let before = document.objects.len();
+
+
                 match pair.value_string.as_str() {
                     "DICTIONARY" => {
                         if let Some(obj) = self.read_dictionary()? {

@@ -203,7 +203,7 @@ fn eval_acexpr(doc: &CadDocument, code: &str, host: Handle) -> Option<String> {
 /// exactly one.
 fn table_for_host(doc: &CadDocument, host: Handle) -> Option<&Table> {
     if let Some(EntityType::Table(table)) = doc.get_entity(host) {
-        return Some(table);
+        return Some(&**table);
     }
     let owner = doc
         .entities()
@@ -211,14 +211,14 @@ fn table_for_host(doc: &CadDocument, host: Handle) -> Option<&Table> {
         .map(|e| e.common().owner_handle);
     if let Some(owner) = owner {
         if let Some(t) = doc.entities().find_map(|e| match e {
-            EntityType::Table(t) if t.block_record_handle == Some(owner) => Some(t),
+            EntityType::Table(t) if t.block_record_handle == Some(owner) => Some(&**t),
             _ => None,
         }) {
             return Some(t);
         }
     }
     let mut tables = doc.entities().filter_map(|e| match e {
-        EntityType::Table(t) => Some(t),
+        EntityType::Table(t) => Some(&**t),
         _ => None,
     });
     let first = tables.next()?;

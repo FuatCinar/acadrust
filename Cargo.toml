@@ -2,7 +2,7 @@
 name = "acadrust"
 version = "0.5.5"
 edition = "2021"
-authors = ["Hakan AK"]
+authors = ["Hakan AK", "Fuat Deneme"]
 description = "A pure Rust library for reading and writing CAD files in DXF format (ASCII and Binary) and DWG format (Binary)."
 license = "MPL-2.0"
 repository = "https://github.com/hakanaktt/acadrust"

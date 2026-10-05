@@ -100,6 +100,15 @@ pub struct DimensionBase {
     /// follows the dimension style (DIMTAD etc.); when true `text_middle_point`
     /// is an explicit override.
     pub text_user_positioned: bool,
+    /// Yalnızca ÇİZİM için: bu ölçü ölçekli bir INSERT'in (blok) içinden
+    /// açıldıysa, o INSERT'in birikmiş düzlem ölçeği (1.0 = ölçeksiz).
+    ///
+    /// Ölçü geometrisi (tanım noktaları) INSERT ölçeğiyle küçülür/büyür ama ok,
+    /// yazı ve uzantı boyutları DIMSTYLE'dan gelir; AutoCAD'de ise bunlar da
+    /// anonim `*D` bloğunun parçası olarak birlikte ölçeklenir. Render katmanı
+    /// bu değeri stil boyutlarına uygular. Dosyaya YAZILMAZ ve düzenleme
+    /// (taşı/ölçekle) komutlarını etkilemez; sadece `Insert::explode*` ayarlar.
+    pub render_scale: f64,
 }
 
 impl DimensionBase {
@@ -130,6 +139,7 @@ impl DimensionBase {
             flip_arrow2: false,
             dwg_flags_byte: 0,
             text_user_positioned: false,
+            render_scale: 1.0,
         }
     }
 
@@ -1094,44 +1104,96 @@ impl super::Entity for Dimension {
     }
 
     fn apply_transform(&mut self, transform: &Transform) {
-        let Dimension::Ordinate(d) = self else {
-            let translated = transform.apply(Vector3::ZERO);
-            self.translate(translated);
-            return;
-        };
+        // ONEMLI DUZELTME: eskiden SADECE Dimension::Ordinate tam donusum
+        // (rotasyon+scale+translation) aliyordu; digger 8 tip
+        // (Linear/Aligned/Radius/Diameter/Angular2Ln/Angular3Pt/Arc/
+        // LargeRadial) sadece transform.apply(Vector3::ZERO) ile elde
+        // edilen SAF OTELEME miktarini aliyordu - yani donen/olceklenen bir
+        // block icindeki bu tip dimension'lar yanlis konum/aciya sahip
+        // oluyordu (blok icindeki diger geometri dogru donsurulurken,
+        // dimension sadece kaydiriliyordu). Simdi TUM tipler icin ayni
+        // dogru mantik (Ordinate'in zaten kullandigi OCS-koruyan
+        // normal/eksen/text_rotation hesaplarinin) uygulaniyor.
 
-        let old_normal = d.base.normal;
+        let base = self.base_mut();
+        let old_normal = base.normal;
         let old_basis = Matrix3::arbitrary_axis(old_normal);
-        let old_axis_angle = -d.base.horizontal_direction;
+        let old_axis_angle = -base.horizontal_direction;
         let old_axis = old_basis * Vector3::new(old_axis_angle.cos(), old_axis_angle.sin(), 0.0);
-        let old_text_angle = old_axis_angle + d.base.text_rotation;
+        let old_text_angle = old_axis_angle + base.text_rotation;
         let old_text_axis =
             old_basis * Vector3::new(old_text_angle.cos(), old_text_angle.sin(), 0.0);
 
-        d.definition_point = transform.apply(d.definition_point);
-        d.feature_location = transform.apply(d.feature_location);
-        d.leader_endpoint = transform.apply(d.leader_endpoint);
-        d.base.definition_point = d.definition_point;
-        d.base.text_middle_point = transform.apply(d.base.text_middle_point);
-        d.base.insertion_point = transform.apply(d.base.insertion_point);
+        base.text_middle_point = transform.apply(base.text_middle_point);
+        base.insertion_point = transform.apply(base.insertion_point);
 
         let transformed_normal = transform.apply_rotation(old_normal);
         if transformed_normal.length() > 1e-12 {
-            d.base.normal = transformed_normal.normalize();
+            base.normal = transformed_normal.normalize();
         }
-        let new_wcs_to_ocs = Matrix3::arbitrary_axis(d.base.normal).transpose();
+        let new_wcs_to_ocs = Matrix3::arbitrary_axis(base.normal).transpose();
         let transformed_axis = new_wcs_to_ocs * transform.apply_rotation(old_axis);
         let mut new_axis_angle = old_axis_angle;
         if transformed_axis.length() > 1e-12 {
             new_axis_angle = transformed_axis.y.atan2(transformed_axis.x);
-            d.base.horizontal_direction = -new_axis_angle;
+            base.horizontal_direction = -new_axis_angle;
         }
         let transformed_text_axis = new_wcs_to_ocs * transform.apply_rotation(old_text_axis);
         if transformed_text_axis.length() > 1e-12 {
             let relative = transformed_text_axis.y.atan2(transformed_text_axis.x) - new_axis_angle;
-            d.base.text_rotation = relative.sin().atan2(relative.cos());
+            base.text_rotation = relative.sin().atan2(relative.cos());
         }
-        d.refresh_measurement();
+
+        let new_def_point = transform.apply(self.definition_point());
+        self.set_definition_point(new_def_point);
+        self.base_mut().definition_point = new_def_point;
+
+        // Tipe ozel diger noktalar - translate_dimension ile ayni alan
+        // listesi, ama +offset yerine TAM transform.apply() kullaniliyor.
+        match self {
+            Dimension::Aligned(d) => {
+                d.first_point = transform.apply(d.first_point);
+                d.second_point = transform.apply(d.second_point);
+            }
+            Dimension::Linear(d) => {
+                d.first_point = transform.apply(d.first_point);
+                d.second_point = transform.apply(d.second_point);
+            }
+            Dimension::Radius(d) => {
+                d.angle_vertex = transform.apply(d.angle_vertex);
+            }
+            Dimension::Diameter(d) => {
+                d.angle_vertex = transform.apply(d.angle_vertex);
+            }
+            Dimension::Angular2Ln(d) => {
+                d.dimension_arc = transform.apply(d.dimension_arc);
+                d.angle_vertex = transform.apply(d.angle_vertex);
+                d.first_point = transform.apply(d.first_point);
+                d.second_point = transform.apply(d.second_point);
+            }
+            Dimension::Angular3Pt(d) => {
+                d.angle_vertex = transform.apply(d.angle_vertex);
+                d.first_point = transform.apply(d.first_point);
+                d.second_point = transform.apply(d.second_point);
+            }
+            Dimension::Ordinate(d) => {
+                d.feature_location = transform.apply(d.feature_location);
+                d.leader_endpoint = transform.apply(d.leader_endpoint);
+                d.refresh_measurement();
+            }
+            Dimension::Arc(d) => {
+                d.first_extension_point = transform.apply(d.first_extension_point);
+                d.second_extension_point = transform.apply(d.second_extension_point);
+                d.center_point = transform.apply(d.center_point);
+                d.first_leader_point = transform.apply(d.first_leader_point);
+                d.second_leader_point = transform.apply(d.second_leader_point);
+            }
+            Dimension::LargeRadial(d) => {
+                d.chord_point = transform.apply(d.chord_point);
+                d.override_center = transform.apply(d.override_center);
+                d.jog_point = transform.apply(d.jog_point);
+            }
+        }
     }
 
     fn entity_type(&self) -> &'static str {

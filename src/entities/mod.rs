@@ -118,7 +118,7 @@ pub use polyline::{
     Polyline, Polyline2D, PolylineFlags, SmoothSurfaceType, Vertex2D, Vertex3D, VertexFlags,
 };
 pub use polyline3d::{Polyline3D, Polyline3DFlags, Vertex3DPolyline};
-pub use proxy_graphics::{ProxyGraphicRecord, ProxyGraphics, ProxyUnicodeText};
+pub use proxy_graphics::{ProxyGraphicRecord, ProxyGraphics, ProxyPrimitive, ProxyUnicodeText};
 pub use raster_image::{
     ClipBoundary, ClipMode, ClipType, ImageDefinition, ImageDisplayFlags, ImageDisplayQuality,
     RasterImage, RasterImageBuilder, ResolutionUnit,
@@ -461,9 +461,9 @@ pub enum EntityType {
     /// Spline entity
     Spline(Spline),
     /// Helix entity (spline-derived 3D spiral)
-    Helix(Helix),
+    Helix(Box<Helix>),
     /// Dimension entity
-    Dimension(Dimension),
+    Dimension(Box<Dimension>),
     /// Hatch entity
     Hatch(Hatch),
     /// Solid entity
@@ -481,7 +481,7 @@ pub enum EntityType {
     /// XLine entity (construction line, infinite)
     XLine(XLine),
     /// Viewport entity (paper space viewport)
-    Viewport(Viewport),
+    Viewport(Box<Viewport>),
     /// Attribute definition entity
     AttributeDefinition(AttributeDefinition),
     /// Attribute entity (block attribute instance)
@@ -489,7 +489,7 @@ pub enum EntityType {
     /// Leader entity
     Leader(Leader),
     /// MultiLeader entity
-    MultiLeader(MultiLeader),
+    MultiLeader(Box<MultiLeader>),
     /// MLine (multiline) entity
     MLine(MLine),
     /// Mesh entity
@@ -503,9 +503,9 @@ pub enum EntityType {
     /// Body entity
     Body(Body),
     /// Surface entity (ACAD_SURFACE family: lofted/swept/extruded/etc.)
-    Surface(Surface),
+    Surface(Box<Surface>),
     /// Table entity
-    Table(Table),
+    Table(Box<Table>),
     /// Tolerance entity (geometric tolerancing)
     Tolerance(Tolerance),
     /// PolyfaceMesh entity
@@ -523,11 +523,11 @@ pub enum EntityType {
     /// Polygon mesh (3D surface mesh)
     PolygonMesh(PolygonMeshEntity),
     /// Light entity (point / spot / distant light source)
-    Light(Light),
+    Light(Box<Light>),
     SectionSymbol(SectionSymbol),
     ViewBorder(ViewBorder),
     /// Structured class-based and legacy entities.
-    Extended(ExtendedEntity),
+    Extended(Box<ExtendedEntity>),
     /// Unknown / unsupported entity type (common fields only)
     Unknown(UnknownEntity),
 }
@@ -567,8 +567,8 @@ impl EntityType {
             EntityType::Text(e) => e,
             EntityType::MText(e) => e,
             EntityType::Spline(e) => e,
-            EntityType::Helix(e) => e,
-            EntityType::Dimension(e) => e,
+            EntityType::Helix(e) => &**e,
+            EntityType::Dimension(e) => &**e,
             EntityType::Hatch(e) => e,
             EntityType::Solid(e) => e,
             EntityType::Face3D(e) => e,
@@ -577,19 +577,19 @@ impl EntityType {
             EntityType::BlockEnd(e) => e,
             EntityType::Ray(e) => e,
             EntityType::XLine(e) => e,
-            EntityType::Viewport(e) => e,
+            EntityType::Viewport(e) => &**e,
             EntityType::AttributeDefinition(e) => e,
             EntityType::AttributeEntity(e) => e,
             EntityType::Leader(e) => e,
-            EntityType::MultiLeader(e) => e,
+            EntityType::MultiLeader(e) => &**e,
             EntityType::MLine(e) => e,
             EntityType::Mesh(e) => e,
             EntityType::RasterImage(e) => e,
             EntityType::Solid3D(e) => e,
             EntityType::Region(e) => e,
             EntityType::Body(e) => e,
-            EntityType::Surface(e) => e,
-            EntityType::Table(e) => e,
+            EntityType::Surface(e) => &**e,
+            EntityType::Table(e) => &**e,
             EntityType::Tolerance(e) => e,
             EntityType::PolyfaceMesh(e) => e,
             EntityType::Wipeout(e) => e,
@@ -598,10 +598,10 @@ impl EntityType {
             EntityType::Seqend(e) => e,
             EntityType::Ole2Frame(e) => e,
             EntityType::PolygonMesh(e) => e,
-            EntityType::Light(e) => e,
+            EntityType::Light(e) => &**e,
             EntityType::SectionSymbol(e) => e,
             EntityType::ViewBorder(e) => e,
-            EntityType::Extended(e) => e,
+            EntityType::Extended(e) => &**e,
             EntityType::Unknown(e) => e,
         }
     }
@@ -621,8 +621,8 @@ impl EntityType {
             EntityType::MText(e) => e,
             EntityType::Text(e) => e,
             EntityType::Spline(e) => e,
-            EntityType::Helix(e) => e,
-            EntityType::Dimension(e) => e,
+            EntityType::Helix(e) => &mut **e,
+            EntityType::Dimension(e) => &mut **e,
             EntityType::Hatch(e) => e,
             EntityType::Solid(e) => e,
             EntityType::Face3D(e) => e,
@@ -631,19 +631,19 @@ impl EntityType {
             EntityType::BlockEnd(e) => e,
             EntityType::Ray(e) => e,
             EntityType::XLine(e) => e,
-            EntityType::Viewport(e) => e,
+            EntityType::Viewport(e) => &mut **e,
             EntityType::AttributeDefinition(e) => e,
             EntityType::AttributeEntity(e) => e,
             EntityType::Leader(e) => e,
-            EntityType::MultiLeader(e) => e,
+            EntityType::MultiLeader(e) => &mut **e,
             EntityType::MLine(e) => e,
             EntityType::Mesh(e) => e,
             EntityType::RasterImage(e) => e,
             EntityType::Solid3D(e) => e,
             EntityType::Region(e) => e,
             EntityType::Body(e) => e,
-            EntityType::Surface(e) => e,
-            EntityType::Table(e) => e,
+            EntityType::Surface(e) => &mut **e,
+            EntityType::Table(e) => &mut **e,
             EntityType::Tolerance(e) => e,
             EntityType::PolyfaceMesh(e) => e,
             EntityType::Wipeout(e) => e,
@@ -652,10 +652,10 @@ impl EntityType {
             EntityType::Seqend(e) => e,
             EntityType::Ole2Frame(e) => e,
             EntityType::PolygonMesh(e) => e,
-            EntityType::Light(e) => e,
+            EntityType::Light(e) => &mut **e,
             EntityType::SectionSymbol(e) => e,
             EntityType::ViewBorder(e) => e,
-            EntityType::Extended(e) => e,
+            EntityType::Extended(e) => &mut **e,
             EntityType::Unknown(e) => e,
         }
     }

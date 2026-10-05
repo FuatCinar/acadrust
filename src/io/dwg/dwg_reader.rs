@@ -272,18 +272,34 @@ pub struct DwgPageCrcInfo {
 pub struct DwgReadOptions {
     /// When `true`, recover as much data as possible from corrupt files.
     pub failsafe: bool,
+    /// When `true` (default), every entity keeps its verbatim DWG record so an
+    /// untouched entity can be written back byte-for-byte. Turn off for
+    /// view-only loads to save a large amount of memory; documents loaded that
+    /// way must be re-encoded on save.
+    #[cfg_attr(feature = "serde", serde(default = "default_keep_raw_records"))]
+    pub keep_raw_records: bool,
+}
+
+#[cfg(feature = "serde")]
+fn default_keep_raw_records() -> bool {
+    true
 }
 
 impl Default for DwgReadOptions {
     fn default() -> Self {
-        Self { failsafe: false }
+        Self { failsafe: false, keep_raw_records: true }
     }
 }
 
 impl DwgReadOptions {
     /// Create options with failsafe mode enabled.
     pub fn failsafe() -> Self {
-        Self { failsafe: true }
+        Self { failsafe: true, keep_raw_records: true }
+    }
+
+    /// Options for view-only loads: no per-entity raw records (lower memory).
+    pub fn viewer() -> Self {
+        Self { failsafe: false, keep_raw_records: false }
     }
 }
 
@@ -1096,6 +1112,7 @@ impl<R: Read + Seek> DwgReader<R> {
                         record_stream_read = true;
                         let mut builder = crate::io::dwg::dwg_document_builder::DwgDocumentBuilder::new(obj_reader);
                         builder.set_failsafe(failsafe);
+                        builder.set_keep_raw_records(self.options.keep_raw_records);
                         if let Some(progress) = &self.progress {
                             builder.set_progress_callback(progress.clone());
                         }

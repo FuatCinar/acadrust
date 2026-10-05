@@ -268,6 +268,29 @@ impl DxfClassCollection {
         }
     }
 
+    /// IMAGE / IMAGEDEF / IMAGEDEF_REACTOR sınıflarını (yoksa) ekler. Raster resim
+    /// yazan kod, DWG/DXF çıktısında bu sınıfların bulunmasını garanti etmek için çağırır.
+    pub fn ensure_raster_image_classes(&mut self) {
+        let defs: [(&str, &str, u16, bool); 3] = [
+            ("IMAGE", "AcDbRasterImage", 127, true),
+            ("IMAGEDEF", "AcDbRasterImageDef", 0, false),
+            ("IMAGEDEF_REACTOR", "AcDbRasterImageDefReactor", 1, false),
+        ];
+        for (dxf, cpp, flags, is_entity) in defs {
+            if self.contains(dxf) {
+                continue;
+            }
+            let mut c = if is_entity {
+                DxfClass::new_entity(dxf, cpp)
+            } else {
+                DxfClass::new(dxf, cpp)
+            };
+            c.proxy_flags = ProxyFlags(flags);
+            c.application_name = "ISM".to_string();
+            self.add_or_update(c);
+        }
+    }
+
     /// Populate with default class definitions that AutoCAD expects.
     ///
     /// This mirrors the reference `DxfClassCollection.UpdateDxfClasses()`.

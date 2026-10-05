@@ -413,6 +413,10 @@ pub struct DwgDocumentBuilder {
     obj_reader: DwgObjectReader,
     /// Whether to use failsafe mode (report skipped records via notifications).
     failsafe: bool,
+    /// Keep each entity's verbatim record (`EntityCommon::raw_record`) so an
+    /// untouched entity can be copied on write. Viewer-only loads turn this
+    /// off: it roughly duplicates the decoded object stream in RAM.
+    keep_raw_records: bool,
     /// Notifications collected during building.
     notifications: NotificationCollection,
     /// Shared with `DwgReader`; reports the object-build portion of the
@@ -451,6 +455,7 @@ impl DwgDocumentBuilder {
         Self {
             obj_reader,
             failsafe: false,
+            keep_raw_records: true,
             notifications: NotificationCollection::new(),
             progress: None,
         }
@@ -462,6 +467,11 @@ impl DwgDocumentBuilder {
     /// instead of being silently lost.
     pub fn set_failsafe(&mut self, failsafe: bool) {
         self.failsafe = failsafe;
+    }
+
+    /// Enable or disable keeping per-entity raw records (default: enabled).
+    pub fn set_keep_raw_records(&mut self, keep: bool) {
+        self.keep_raw_records = keep;
     }
 
     pub fn set_progress_callback(&mut self, progress: std::sync::Arc<dyn Fn(u16) + Send + Sync>) {
@@ -3176,11 +3186,13 @@ impl DwgDocumentBuilder {
             );
             // Keep the verbatim record so an untouched entity can be copied on write
             // instead of re-encoded (see EntityCommon::raw_record).
-            entity_common.raw_record = Some(std::sync::Arc::new(crate::entities::RawRecord {
-                data: reader.raw_merged_data(),
-                handle_bits: reader.get_handle_bits(),
-                version: self.obj_reader.dxf_version(),
-            }));
+            if self.keep_raw_records {
+                entity_common.raw_record = Some(std::sync::Arc::new(crate::entities::RawRecord {
+                    data: reader.raw_merged_data(),
+                    handle_bits: reader.get_handle_bits(),
+                    version: self.obj_reader.dxf_version(),
+                }));
+            }
 
             match type_code {
                 // ── Simple entities ────────────────────────────────
@@ -3239,7 +3251,7 @@ impl DwgDocumentBuilder {
                     e.shadow_map_softness = data.shadow_map_softness;
                     e.photometric_mode = data.photometric_mode;
                     e.photometric_data = data.photometric_data;
-                    let _ = document.add_entity(EntityType::Light(e));
+                    let _ = document.add_entity(EntityType::Light(Box::new(e)));
                 }
                 OBJ_CAMERA
                 | OBJ_SECTIONOBJECT
@@ -3292,10 +3304,10 @@ impl DwgDocumentBuilder {
                         ),
                         _ => unreachable!(),
                     };
-                    let _ = document.add_entity(EntityType::Extended(ExtendedEntity {
+                    let _ = document.add_entity(EntityType::Extended(Box::new(ExtendedEntity {
                         common: entity_common,
                         data,
-                    }));
+                    })));
                 }
                 OBJ_ARC => {
                     let data = entities::read_arc(&mut reader);
@@ -3469,7 +3481,7 @@ impl DwgDocumentBuilder {
                     e.legacy_border_colors = data.legacy_border_colors;
                     e.legacy_border_line_weights = data.legacy_border_line_weights;
                     e.legacy_border_visibility = data.legacy_border_visibility;
-                    let _ = document.add_entity(EntityType::Table(e));
+                    let _ = document.add_entity(EntityType::Table(Box::new(e)));
                 }
                 OBJ_LWPOLYLINE => {
                     let data = entities::read_lwpolyline(&mut reader, self.obj_reader.version());
@@ -3556,7 +3568,7 @@ impl DwgDocumentBuilder {
                     e.turn_height = reader.read_bit_double();
                     e.handedness = reader.read_bit();
                     e.constraint = crate::entities::HelixConstraint::from_code(reader.read_byte());
-                    let _ = document.add_entity(EntityType::Helix(e));
+                    let _ = document.add_entity(EntityType::Helix(Box::new(e)));
                 }
                 OBJ_TEXT => {
                     let data = entities::read_text(&mut reader, self.obj_reader.version());
@@ -3656,7 +3668,7 @@ impl DwgDocumentBuilder {
                     e.direction = data.direction;
                     e.normal = data.normal;
                     e.dimension_style_handle = Some(Handle::from(data.dimstyle_handle));
-                    e.dimension_style_name.clear();
+                    e.dimension_style_name = maps.dimstyle_name(data.dimstyle_handle);
                     e.dwg_unknown_short = data.unknown_short;
                     e.text_height = data.text_height;
                     e.dimension_gap = data.dimgap;
@@ -3841,7 +3853,7 @@ impl DwgDocumentBuilder {
                             e.sun_handle = Handle::new(sun);
                         }
                     }
-                    let _ = document.add_entity(EntityType::Viewport(e));
+                    let _ = document.add_entity(EntityType::Viewport(Box::new(e)));
                 }
                 OBJ_POLYLINE_2D => {
                     let data = entities::read_polyline2d(&mut reader, self.obj_reader.version());
@@ -3886,7 +3898,7 @@ impl DwgDocumentBuilder {
                     dim.base.definition_point = data.definition_point;
                     dim.rotation = data.rotation;
                     dim.ext_line_rotation = data.ext_line_rotation;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Linear(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dim))));
                 }
                 OBJ_DIMENSION_ALIGNED => {
                     let data = entities::read_dimension_aligned(
@@ -3900,7 +3912,7 @@ impl DwgDocumentBuilder {
                     dim.definition_point = data.definition_point;
                     dim.base.definition_point = data.definition_point;
                     dim.ext_line_rotation = data.ext_line_rotation;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Aligned(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Aligned(dim))));
                 }
                 OBJ_DIMENSION_RADIUS => {
                     let data = entities::read_dimension_radius(
@@ -3913,7 +3925,7 @@ impl DwgDocumentBuilder {
                     map_dimension_common(&mut dim.base, &data.common, &maps);
                     dim.base.definition_point = data.definition_point;
                     dim.leader_length = data.leader_length;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Radius(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Radius(dim))));
                 }
                 OBJ_DIMENSION_DIAMETER => {
                     let data = entities::read_dimension_diameter(
@@ -3926,7 +3938,7 @@ impl DwgDocumentBuilder {
                     map_dimension_common(&mut dim.base, &data.common, &maps);
                     dim.base.definition_point = data.definition_point;
                     dim.leader_length = data.leader_length;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Diameter(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Diameter(dim))));
                 }
                 OBJ_DIMENSION_ANG_2LN => {
                     let data = entities::read_dimension_angular_2ln(
@@ -3944,7 +3956,7 @@ impl DwgDocumentBuilder {
                     dim.angle_vertex = data.angle_vertex;
                     dim.definition_point = data.definition_point;
                     dim.base.definition_point = data.definition_point;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Angular2Ln(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Angular2Ln(dim))));
                 }
                 OBJ_DIMENSION_ANG_3PT => {
                     let data = entities::read_dimension_angular_3pt(
@@ -3960,7 +3972,7 @@ impl DwgDocumentBuilder {
                     dim.angle_vertex = data.angle_vertex;
                     dim.definition_point = data.definition_point;
                     dim.base.definition_point = data.definition_point;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Angular3Pt(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Angular3Pt(dim))));
                 }
                 OBJ_DIMENSION_ORDINATE => {
                     let data = entities::read_dimension_ordinate(
@@ -3978,7 +3990,7 @@ impl DwgDocumentBuilder {
                     dim.definition_point = data.definition_point;
                     dim.base.definition_point = data.definition_point;
                     dim.refresh_measurement();
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Ordinate(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Ordinate(dim))));
                 }
                 OBJ_ARC_DIMENSION => {
                     let data = entities::read_dimension_arc(
@@ -4000,7 +4012,7 @@ impl DwgDocumentBuilder {
                     dim.has_leader = data.has_leader;
                     dim.first_leader_point = data.first_leader_point;
                     dim.second_leader_point = data.second_leader_point;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::Arc(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::Arc(dim))));
                 }
                 OBJ_LARGE_RADIAL_DIMENSION => {
                     let data = entities::read_dimension_large_radial(
@@ -4017,7 +4029,7 @@ impl DwgDocumentBuilder {
                     dim.jog_angle = data.jog_angle;
                     dim.override_center = data.override_center;
                     dim.jog_point = data.jog_point;
-                    let _ = document.add_entity(EntityType::Dimension(Dimension::LargeRadial(dim)));
+                    let _ = document.add_entity(EntityType::Dimension(Box::new(Dimension::LargeRadial(dim))));
                 }
 
                 OBJ_MLINE => {
@@ -4173,7 +4185,7 @@ impl DwgDocumentBuilder {
                         TextAttachmentType::from(data.text_bottom_attachment);
                     e.text_top_attachment = TextAttachmentType::from(data.text_top_attachment);
                     e.extend_leader_to_text = data.extend_leader_to_text;
-                    let _ = document.add_entity(EntityType::MultiLeader(e));
+                    let _ = document.add_entity(EntityType::MultiLeader(Box::new(e)));
                 }
 
                 // ── Attribute entities ─────────────────────────────
@@ -4697,7 +4709,7 @@ impl DwgDocumentBuilder {
                     e.surface_data = data.surface_data;
                     e.history_handle =
                         (data.history_handle != 0).then(|| Handle::from(data.history_handle));
-                    let _ = document.add_entity(EntityType::Surface(e));
+                    let _ = document.add_entity(EntityType::Surface(Box::new(e)));
                 }
 
                 // ── Catch-all ──────────────────────────────────────
@@ -4719,15 +4731,15 @@ impl DwgDocumentBuilder {
                                 value.raw_dwg_handle_bits = reader.get_handle_bits();
                                 value.raw_dwg_version = Some(document.version);
                             }
-                            let _ = document.add_entity(EntityType::Extended(
+                            let _ = document.add_entity(EntityType::Extended(Box::new(
                                 ExtendedEntity {
                                     common: entity_common,
                                     data,
                                 },
-                            ));
+                            )));
                         }
                         "mcsDbObjectFormat" => {
-                            let _ = document.add_entity(EntityType::Extended(
+                            let _ = document.add_entity(EntityType::Extended(Box::new(
                                 ExtendedEntity {
                                     common: entity_common,
                                     data: ExtendedEntityData::Format(
@@ -4744,7 +4756,7 @@ impl DwgDocumentBuilder {
                                         },
                                     ),
                                 },
-                            ));
+                            )));
                         }
                         "AcDbBlockAngularConstraintParameterEntity" => {
                             if let Some(data) =
@@ -4753,12 +4765,12 @@ impl DwgDocumentBuilder {
                                     "BLOCKANGULARCONSTRAINTPARAMETERENTITY",
                                 )
                             {
-                                let _ = document.add_entity(EntityType::Extended(
+                                let _ = document.add_entity(EntityType::Extended(Box::new(
                                     ExtendedEntity {
                                         common: entity_common,
                                         data: ExtendedEntityData::DynamicBlock(data),
                                     },
-                                ));
+                                )));
                             }
                         }
                         name @ (
@@ -4779,7 +4791,7 @@ impl DwgDocumentBuilder {
                                     &mut reader,
                                     entity_common.handle.value(),
                                 );
-                            let _ = document.add_entity(EntityType::Extended(
+                            let _ = document.add_entity(EntityType::Extended(Box::new(
                                 ExtendedEntity {
                                     common: entity_common,
                                     data: ExtendedEntityData::RegisteredClass(
@@ -4792,7 +4804,7 @@ impl DwgDocumentBuilder {
                                         },
                                     ),
                                 },
-                            ));
+                            )));
                         }
                         name @ (
                             "AcDbBlockAlignmentParameterEntity"
@@ -4820,12 +4832,12 @@ impl DwgDocumentBuilder {
                                     &dxf_name,
                                 )
                             {
-                                let _ = document.add_entity(EntityType::Extended(
+                                let _ = document.add_entity(EntityType::Extended(Box::new(
                                     ExtendedEntity {
                                         common: entity_common,
                                         data: ExtendedEntityData::DynamicBlock(data),
                                     },
-                                ));
+                                )));
                             }
                         }
                         // AcDbSectionSymbol ("SECTIONLINE"): decode the section

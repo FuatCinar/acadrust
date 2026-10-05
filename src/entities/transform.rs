@@ -191,12 +191,20 @@ pub(crate) fn transform_polyline(e: &mut Polyline, transform: &Transform) {
 
 pub(crate) fn transform_polyline2d(e: &mut Polyline2D, transform: &Transform) {
     let flip = is_reflecting(transform);
+    // See transform_lwpolyline: widths must scale with the transform too, or
+    // a scaled-down INSERT leaves a full-size stroke width on shrunken
+    // geometry.
+    let scale_factor = transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0)).length();
     // Vertices are stored in OCS — transform in world, store back in the new
     // normal's OCS.
     let new_normal = transform.apply_rotation(e.normal).normalize();
     let (ocs, new_t) = ocs_pair(e.normal, new_normal);
+    e.start_width *= scale_factor;
+    e.end_width *= scale_factor;
     for vertex in &mut e.vertices {
         vertex.location = new_t * transform.apply(ocs * vertex.location);
+        vertex.start_width *= scale_factor;
+        vertex.end_width *= scale_factor;
         if flip {
             // Bulge encodes the arc's side/direction in the plane; a
             // reflection reverses it.
@@ -218,17 +226,27 @@ pub(crate) fn transform_polyline3d(e: &mut Polyline3D, transform: &Transform) {
 
 pub(crate) fn transform_lwpolyline(e: &mut LwPolyline, transform: &Transform) {
     let flip = is_reflecting(transform);
+    // Same convention as transform_circle/transform_arc: length of the
+    // transformed unit X axis. Without this, an INSERT that scales its block
+    // down (e.g. a tiny icon block) leaves constant_width/start_width/
+    // end_width at full block-space size, so the "thick" polyline stroke
+    // balloons relative to the now-shrunken vertex geometry - a ring can
+    // even fold past its own center and render as a solid filled blob.
+    let scale_factor = transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0)).length();
     // Vertices + elevation are stored in OCS — transform in world, store back
     // in the new normal's OCS.
     let new_normal = transform.apply_rotation(e.normal).normalize();
     let (ocs, new_t) = ocs_pair(e.normal, new_normal);
     let mut new_elevation = e.elevation;
+    e.constant_width *= scale_factor;
     for vertex in &mut e.vertices {
         let pt3d = Vector3::new(vertex.location.x, vertex.location.y, e.elevation);
         let l = new_t * transform.apply(ocs * pt3d);
         vertex.location.x = l.x;
         vertex.location.y = l.y;
         new_elevation = l.z;
+        vertex.start_width *= scale_factor;
+        vertex.end_width *= scale_factor;
         if flip {
             // Bulge encodes the arc's side/direction in the plane; a
             // reflection reverses it. Without this, exploding a mirrored
@@ -848,6 +866,12 @@ pub(crate) fn transform_multileader(e: &mut MultiLeader, transform: &Transform) 
                 bp.end_point = transform.apply(bp.end_point);
             }
         }
+        // Dogleg yonu de INSERT donusuyle donmeli (aksi halde donmus blokta
+        // landing yanlis yone cizilir).
+        let rotated_dir = transform.apply_rotation(root.direction);
+        if rotated_dir.length() > 1e-12 {
+            root.direction = rotated_dir.normalize();
+        }
     }
 
     let unit_x = Vector3::new(1.0, 0.0, 0.0);
@@ -859,6 +883,12 @@ pub(crate) fn transform_multileader(e: &mut MultiLeader, transform: &Transform) 
     e.context.arrowhead_size *= scale_factor;
     e.context.text_height *= scale_factor;
     e.context.landing_gap *= scale_factor;
+    // Olcekle degisen diger uzunluklar (cerceve/metin kutusu ve dogleg boyu).
+    e.context.text_width *= scale_factor;
+    e.context.text_boundary_height *= scale_factor;
+    for root in &mut e.context.leader_roots {
+        root.landing_distance *= scale_factor;
+    }
 }
 
 // ── MLine ────────────────────────────────────────────────────────────────────

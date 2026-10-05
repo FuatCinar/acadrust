@@ -362,6 +362,24 @@ impl Insert {
         result
     }
 
+    /// Same as [`explode`](Self::explode) but takes references, so callers that
+    /// already own the block entities (e.g. inside a `CadDocument`) do not have
+    /// to clone them first.
+    pub fn explode_refs(&self, block_entities: &[&EntityType]) -> Vec<EntityType> {
+        let transforms = self.array_transforms();
+        let mut result = Vec::with_capacity(block_entities.len() * transforms.len());
+
+        for transform in &transforms {
+            for entity in block_entities {
+                if let Some(exploded) = self.explode_single(entity, transform) {
+                    result.push(exploded);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Build a transform for each array cell (single transform when not MINSERT).
     fn array_transforms(&self) -> Vec<Transform> {
         if !self.is_minsert() {
@@ -428,6 +446,22 @@ impl Insert {
                 Self::apply_full_ellipse_transform(&mut ellipse, transform);
                 self.resolve_properties(&mut ellipse.common);
                 Some(EntityType::Ellipse(ellipse))
+            }
+
+            // Ölçü: geometri apply_transform ile dönüşür ama ok/yazı boyutları
+            // stilden gelir; INSERT ölçeğini çizim için render_scale'e işle
+            // (iç içe bloklarda çarpılarak birikir).
+            EntityType::Dimension(_) => {
+                let mut cloned = entity.clone();
+                cloned.as_entity_mut().apply_transform(transform);
+                if let EntityType::Dimension(d) = &mut cloned {
+                    let k = Self::planar_scale(transform);
+                    if k.is_finite() && k > 1e-12 {
+                        d.base_mut().render_scale *= k;
+                    }
+                }
+                self.resolve_properties(cloned.common_mut());
+                Some(cloned)
             }
 
             // Default path — clone + transform
@@ -502,6 +536,14 @@ impl Insert {
         new_arc.common = arc.common.clone();
         self.resolve_properties(&mut new_arc.common);
         EntityType::Arc(new_arc)
+    }
+
+    /// XY düzlemindeki etkin (geometrik ortalama) ölçek: |det(2x2)|^(1/2).
+    /// Düzgün ölçekte tam ölçek, eşit olmayan ölçekte ortalama verir; öteleme
+    /// ve dönme sonucu değiştirmez.
+    fn planar_scale(transform: &Transform) -> f64 {
+        let m = transform.matrix.m;
+        (m[0][0] * m[1][1] - m[0][1] * m[1][0]).abs().sqrt()
     }
 
     /// Determinant of the upper-3×3 portion of a transform's matrix.
@@ -617,7 +659,25 @@ impl Insert {
     ) -> Vec<EntityType> {
         match document.block_records.get(&self.block_name) {
             Some(br) => {
-                let entities: Vec<EntityType> = br
+                // HIZLI YOL (base_point = 0, bloklarin cogu): blok entity'lerini
+                // once klonlayip (explode_from_document) sonra bir kez daha
+                // klonlamak (explode_single) yerine, referanslarla calis -
+                // entity basina 1 klon yerine 2 klonu onler.
+                if br.base_point == Vector3::ZERO {
+                    let refs: Vec<&EntityType> = br
+                        .entity_handles
+                        .iter()
+                        .filter_map(|h| {
+                            document
+                                .entity_index
+                                .get(h)
+                                .map(|&idx| &*document.entities[idx])
+                        })
+                        .collect();
+                    return self.explode_refs(&refs);
+                }
+
+                let mut entities: Vec<EntityType> = br
                     .entity_handles
                     .iter()
                     .filter_map(|h| {
@@ -627,6 +687,22 @@ impl Insert {
                             .map(|&idx| document.entities[idx].as_ref().clone())
                     })
                     .collect();
+
+                // Block tanimindaki geometri, block'un kendi base_point'ine
+                // gore degil, kendi cizildigi (genelde keyfi) yerel
+                // koordinatlarda saklanir. Insert'in scale/rotate/translate
+                // donusumunu uygulamadan once, geometriyi base_point orijine
+                // (0,0,0) gelecek sekilde kaydiriyoruz - aksi halde
+                // base_point (0,0,0)'dan uzak olan bloklar yanlis yerde ve
+                // yanlis olcekte (buyuk/kucuk) cikar.
+                let base_point = br.base_point;
+                if base_point != Vector3::ZERO {
+                    let offset = Vector3::new(-base_point.x, -base_point.y, -base_point.z);
+                    for entity in entities.iter_mut() {
+                        entity.as_entity_mut().translate(offset);
+                    }
+                }
+
                 self.explode(&entities)
             }
             None => Vec::new(),

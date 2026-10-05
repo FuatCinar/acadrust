@@ -697,10 +697,12 @@ fn explode_hatch(hatch: &Hatch) -> Vec<EntityType> {
                     ));
                 }
                 BoundaryEdge::CircularArc(arc_edge) => {
+                    // Nokta-eslestirme testiyle dogrulandi: CW kenarlarda gercek
+                    // aci start/end YER DEGISTIRIP (swap) negatiflenerek bulunur.
                     let (sa, ea) = if arc_edge.counter_clockwise {
                         (arc_edge.start_angle, arc_edge.end_angle)
                     } else {
-                        (arc_edge.end_angle, arc_edge.start_angle)
+                        (-arc_edge.end_angle, -arc_edge.start_angle)
                     };
                     result.push(EntityType::Arc(Arc {
                         common: inherit_common(common),
@@ -713,6 +715,16 @@ fn explode_hatch(hatch: &Hatch) -> Vec<EntityType> {
                     }));
                 }
                 BoundaryEdge::EllipticArc(ea_edge) => {
+                    // CircularArc ile ayni duzeltme: onceden `counter_clockwise`
+                    // hic kontrol edilmiyordu (CW kenarlar hep yanlis yonde/yerde
+                    // patlatiliyordu). NOT: birim (derece/radyan) belirsizligi
+                    // ayri, dogrulanmamis bir sorun - burada sadece yon/aci
+                    // duzeltmesi yapildi, birim donusumune dokunulmadi.
+                    let (sa, ea) = if ea_edge.counter_clockwise {
+                        (ea_edge.start_angle, ea_edge.end_angle)
+                    } else {
+                        (-ea_edge.end_angle, -ea_edge.start_angle)
+                    };
                     result.push(EntityType::Ellipse(Ellipse {
                         common: inherit_common(common),
                         center: Vector3::new(ea_edge.center.x, ea_edge.center.y, elevation),
@@ -722,8 +734,8 @@ fn explode_hatch(hatch: &Hatch) -> Vec<EntityType> {
                             0.0,
                         ),
                         minor_axis_ratio: ea_edge.minor_axis_ratio,
-                        start_parameter: ea_edge.start_angle,
-                        end_parameter: ea_edge.end_angle,
+                        start_parameter: sa,
+                        end_parameter: ea,
                         normal,
                     }));
                 }
@@ -1202,7 +1214,7 @@ mod tests {
     #[test]
     fn test_explode_dimension() {
         let dim = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));
-        let entity = EntityType::Dimension(Dimension::Linear(dim));
+        let entity = EntityType::Dimension(Box::new(Dimension::Linear(dim)));
         let parts = entity.explode();
         // Should contain dimension lines + text
         assert!(parts.len() >= 2);

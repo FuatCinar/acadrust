@@ -78,6 +78,21 @@ impl BoundaryPathFlags {
         self.bits & 16 != 0
     }
 
+    /// AutoCAD adds a synthetic "textbox" boundary path (used only to keep
+    /// hatch pattern lines clear of associated text) around text objects
+    /// that participate in the hatch's associativity. It is not part of the
+    /// fill geometry and must never be tessellated/filled.
+    pub fn is_textbox(&self) -> bool {
+        self.bits & 8 != 0
+    }
+
+    /// A path AutoCAD flagged as an exact duplicate of another boundary
+    /// path. Keeping both copies in even-odd nesting analysis double-counts
+    /// the region and corrupts hole detection, so duplicates are dropped.
+    pub fn is_duplicate(&self) -> bool {
+        self.bits & 256 != 0
+    }
+
     pub fn is_not_closed(&self) -> bool {
         self.bits & 32 != 0
     }

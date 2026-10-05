@@ -473,6 +473,60 @@ impl AcisData {
         Some(Vector3::new(t[0], t[1], t[2]))
     }
 
+    /// World-space (min, max) of the B-rep vertex points with the body
+    /// placement applied. `None` when unparsable or no `point` records.
+    pub fn geometry_bounds(&self) -> Option<(Vector3, Vector3)> {
+        let doc = self.parse()?;
+        let (m, tr, sc) = doc.placement();
+        let mut min = [f64::MAX; 3];
+        let mut max = [f64::MIN; 3];
+        let mut count = 0usize;
+        for rec in &doc.records {
+            if rec.entity_type != "point" {
+                continue;
+            }
+            let mut p: Option<[f64; 3]> = None;
+            let mut floats: Vec<f64> = Vec::with_capacity(4);
+            for t in &rec.tokens {
+                if let Some((components, len)) = t.coordinate_components() {
+                    if len == 3 {
+                        p = Some(components);
+                    }
+                } else if let Some(value) = t.as_float() {
+                    floats.push(value);
+                }
+            }
+            let Some([x, y, z]) = p.or_else(|| {
+                (floats.len() >= 3).then(|| {
+                    let n = floats.len();
+                    [floats[n - 3], floats[n - 2], floats[n - 1]]
+                })
+            }) else {
+                continue;
+            };
+            let w = [
+                sc * (x * m[0][0] + y * m[1][0] + z * m[2][0]) + tr[0],
+                sc * (x * m[0][1] + y * m[1][1] + z * m[2][1]) + tr[1],
+                sc * (x * m[0][2] + y * m[1][2] + z * m[2][2]) + tr[2],
+            ];
+            if !(w[0].is_finite() && w[1].is_finite() && w[2].is_finite()) {
+                continue;
+            }
+            for k in 0..3 {
+                min[k] = min[k].min(w[k]);
+                max[k] = max[k].max(w[k]);
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return None;
+        }
+        Some((
+            Vector3::new(min[0], min[1], min[2]),
+            Vector3::new(max[0], max[1], max[2]),
+        ))
+    }
+
     /// The centre of the body's vertex-point bounding box, in world space
     /// (body placement applied). `None` when the data can't be parsed or
     /// carries no `point` records. Approximates the geometric centre well for
@@ -758,7 +812,12 @@ impl Solid3D {
     /// Calculates bounding box from wireframe data.
     fn wireframe_bounding_box(&self) -> BoundingBox3D {
         if self.wires.is_empty() {
-            return BoundingBox3D::default();
+            // Tel kafes onbellegi yok (AutoCAD R2013+ / DXF): ACIS B-rep
+            // kose noktalarindan sinir kutusu hesapla.
+            return match self.acis_data.geometry_bounds() {
+                Some((lo, hi)) => BoundingBox3D::new(lo, hi),
+                None => BoundingBox3D::default(),
+            };
         }
 
         let mut min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -989,7 +1048,10 @@ impl Entity for Region {
 
     fn bounding_box(&self) -> BoundingBox3D {
         if self.wires.is_empty() {
-            return BoundingBox3D::default();
+            return match self.acis_data.geometry_bounds() {
+                Some((lo, hi)) => BoundingBox3D::new(lo, hi),
+                None => BoundingBox3D::default(),
+            };
         }
 
         let mut min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -1154,7 +1216,10 @@ impl Entity for Body {
 
     fn bounding_box(&self) -> BoundingBox3D {
         if self.wires.is_empty() {
-            return BoundingBox3D::default();
+            return match self.acis_data.geometry_bounds() {
+                Some((lo, hi)) => BoundingBox3D::new(lo, hi),
+                None => BoundingBox3D::default(),
+            };
         }
 
         let mut min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
