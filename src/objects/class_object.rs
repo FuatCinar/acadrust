@@ -6,6 +6,7 @@
 //! are retained as editable models based on native-format probes and regression
 //! tests; individual class coverage is not a claim of a complete published spec.
 
+use crate::objects::object_data::{ObjectDataDescriptor, ObjectDataDictionary, ObjectDataRecord};
 use crate::types::{Color, Handle, Vector2, Vector3};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -97,6 +98,9 @@ pub enum ClassObjectData {
     ViewRepModelSpaceViewSelectionSet(ViewRepModelSpaceViewSelectionSet),
     ViewRep(ViewRep),
     ViewRepModelSpaceSource(ViewRepModelSpaceSource),
+    ObjectDataDictionary(ObjectDataDictionary),
+    ObjectDataDescriptor(ObjectDataDescriptor),
+    ObjectDataRecord(ObjectDataRecord),
 }
 
 impl ClassObjectData {
@@ -153,12 +157,22 @@ impl ClassObjectData {
             Self::ViewRepModelSpaceViewSelectionSet(_) => "ACDBSYMODELSPACEVIEWSELSET",
             Self::ViewRep(_) => "ACDBVIEWREP",
             Self::ViewRepModelSpaceSource(_) => "ACDBVIEWREPMODELSPACESOURCE",
+            Self::ObjectDataDictionary(_) => "IRD_DSC_DICT",
+            Self::ObjectDataDescriptor(_) => "IRD_DSC_RECORD",
+            Self::ObjectDataRecord(_) => "IRD_OBJ_RECORD",
         }
     }
 
     pub(crate) fn visit_handles_mut(&mut self, visit: &mut impl FnMut(&mut Handle)) {
         match self {
+            Self::ObjectDataDictionary(value) => {
+                for (_, handle) in &mut value.entries {
+                    visit(handle);
+                }
+            }
+            Self::ObjectDataRecord(value) => visit(&mut value.table),
             Self::Empty
+            | Self::ObjectDataDescriptor(_)
             | Self::LayerFilter(_)
             | Self::VbaProject(_)
             | Self::Sun(_)
@@ -258,6 +272,11 @@ impl ClassObjectData {
             Self::DataLink(value) => {
                 for data in &mut value.custom_data {
                     visit(&mut data.target);
+                }
+                for item in &mut value.data_map {
+                    if let Some(handle) = &mut item.value.handle_value {
+                        visit(handle);
+                    }
                 }
                 visit(&mut value.hard_owner);
             }
@@ -1224,7 +1243,19 @@ pub struct DataLink {
     pub status_flags: i32,
     pub update_status: String,
     pub custom_data: Vec<DataLinkCustomData>,
+    /// The link's data map (`CUSTOMDATA` / `DATAMAP` in DXF, a custom data collection in DWG):
+    /// for an Excel link, `ACEXCEL_CONNECTION_STRING`, `ACEXCEL_SOURCEDATE` and
+    /// `ACEXCEL_UPDATEOPTIONS`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub data_map: Vec<crate::entities::TableCustomData>,
     pub hard_owner: Handle,
+}
+
+impl DataLink {
+    /// Bit of the DWG option that says the data map follows. AutoCAD sets it whenever the map is
+    /// written and leaves it out of the option it shows (DXF group 90, `entget`); a DWG link whose
+    /// bit and map disagree can't be opened by AutoCAD.
+    pub const HAS_DATA_MAP: i32 = 8;
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

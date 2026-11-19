@@ -56,7 +56,7 @@ impl DwgObjectWriter<'_> {
     pub(super) fn write_architecture_object(&mut self, object: &ArchObject) {
         let body = Self::architecture_object_body(object, self.dxf_version)
             .expect("Arch object record was validated before writing");
-        let type_code = self.class_type_code(&object.dxf_name, body.type_code);
+        let type_code = self.source_class_type_code(&object.dxf_name, body.type_code);
         let source_eed = if self.document.eed_by_handle.contains_key(&object.handle) {
             Vec::new()
         } else {
@@ -125,6 +125,20 @@ impl DwgObjectWriter<'_> {
         body: impl FnOnce(&mut DwgMergedWriter),
     ) -> (Vec<u8>, i64) {
         self.write_common_non_entity_data(type_code, handle, owner, &[owner], &None);
+        body(&mut self.writer);
+        self.finish_architecture_record()
+    }
+
+    /// A civil record: like an Arch object, with the reactors given.
+    pub(crate) fn encode_civil_object(
+        &mut self,
+        type_code: i16,
+        handle: Handle,
+        owner: Handle,
+        reactors: &[Handle],
+        body: impl FnOnce(&mut DwgMergedWriter),
+    ) -> (Vec<u8>, i64) {
+        self.write_common_non_entity_data(type_code, handle, owner, reactors, &None);
         body(&mut self.writer);
         self.finish_architecture_record()
     }

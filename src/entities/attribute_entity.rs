@@ -43,6 +43,9 @@ pub struct AttributeEntity {
     pub alignment_point: Vector3,
     /// Text height
     pub height: f64,
+    /// Signed extrusion thickness in drawing units.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub thickness: f64,
     /// Rotation angle in radians
     pub rotation: f64,
     /// Relative X scale factor (width factor)
@@ -90,6 +93,7 @@ impl AttributeEntity {
             insertion_point: Vector3::ZERO,
             alignment_point: Vector3::ZERO,
             height: 2.5,
+            thickness: 0.0,
             rotation: 0.0,
             width_factor: 1.0,
             oblique_angle: 0.0,
@@ -119,6 +123,12 @@ impl AttributeEntity {
         attdef: &crate::entities::AttributeDefinition,
         value: Option<String>,
     ) -> Self {
+        // A multiline attribute keeps its text in the embedded MTEXT too; give it the
+        // instance value, not the definition's default.
+        let mut embedded_mtext = attdef.embedded_mtext.clone();
+        if let (Some(mtext), Some(value)) = (embedded_mtext.as_mut(), value.as_ref()) {
+            mtext.value = value.clone();
+        }
         Self {
             common: EntityCommon {
                 layer: attdef.common.layer.clone(),
@@ -132,6 +142,7 @@ impl AttributeEntity {
             insertion_point: attdef.insertion_point,
             alignment_point: attdef.alignment_point,
             height: attdef.height,
+            thickness: attdef.thickness,
             rotation: attdef.rotation,
             width_factor: attdef.width_factor,
             oblique_angle: attdef.oblique_angle,
@@ -142,18 +153,29 @@ impl AttributeEntity {
             flags: attdef.flags,
             field_length: attdef.field_length,
             normal: attdef.normal,
-            mtext_flag: attdef.mtext_flag,
+            // DWG type 4 marks a multiline ATTDEF; on an ATTRIB the reference reads 4 as single
+            // line, so the instance takes 2.
+            mtext_flag: match attdef.mtext_flag {
+                MTextFlag::ConstantMultiLine => MTextFlag::MultiLine,
+                flag => flag,
+            },
             is_multiline: attdef.is_multiline,
             line_count: attdef.line_count,
-            embedded_mtext: attdef.embedded_mtext.clone(),
+            embedded_mtext,
             attdef_handle: attdef.common.handle,
             lock_position: attdef.lock_position,
         }
     }
 
-    /// Set the attribute value
+    /// Set the attribute value. A multi-line attribute's embedded MTEXT is what DWG/DXF R2018+
+    /// write and AutoCAD shows, so it takes the same text.
     pub fn set_value(&mut self, value: impl Into<String>) {
-        self.value = value.into();
+        let value = value.into();
+        if let Some(mtext) = self.embedded_mtext.as_mut() {
+            // MTEXT breaks a line with `\P`; a raw line feed in a plain value would not.
+            mtext.value = value.replace("\r\n", "\\P").replace(['\n', '\r'], "\\P");
+        }
+        self.value = value;
     }
 
     /// Get the attribute value
@@ -308,6 +330,12 @@ impl Entity for AttributeEntity {
         &mut self.common
     }
 
+    /// Hidden by the entity flag (group 60) or by the attribute's own
+    /// invisible flag (group 70, bit 1).
+    fn is_invisible(&self) -> bool {
+        self.common.invisible || self.flags.invisible
+    }
+
     fn bounding_box(&self) -> BoundingBox3D {
         let width = self.estimated_width();
         let height = self.height;
@@ -383,6 +411,40 @@ mod tests {
         // With default value
         let attrib2 = AttributeEntity::from_definition(&attdef, None);
         assert_eq!(attrib2.value, "default");
+    }
+
+    #[test]
+    fn test_attrib_from_multiline_definition_sets_embedded_value() {
+        let mut attdef = AttributeDefinition::new(
+            "TAG".to_string(),
+            "Enter:".to_string(),
+            "DEFAULT".to_string(),
+        );
+        let mut mtext = crate::entities::MText::new();
+        mtext.value = "DEFAULT".to_string();
+        attdef.is_multiline = true;
+        attdef.embedded_mtext = Some(Box::new(mtext));
+
+        let attrib =
+            AttributeEntity::from_definition(&attdef, Some("CUSTOM one\\PCUSTOM two".to_string()));
+        assert_eq!(attrib.value, "CUSTOM one\\PCUSTOM two");
+        assert_eq!(
+            attrib.embedded_mtext.as_ref().map(|m| m.value.as_str()),
+            Some("CUSTOM one\\PCUSTOM two")
+        );
+
+        let mut attdef4 = attdef.clone();
+        attdef4.mtext_flag = MTextFlag::ConstantMultiLine;
+        assert_eq!(
+            AttributeEntity::from_definition(&attdef4, None).mtext_flag,
+            MTextFlag::MultiLine
+        );
+
+        let attrib2 = AttributeEntity::from_definition(&attdef, None);
+        assert_eq!(
+            attrib2.embedded_mtext.as_ref().map(|m| m.value.as_str()),
+            Some("DEFAULT")
+        );
     }
 
     #[test]

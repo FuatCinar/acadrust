@@ -232,6 +232,7 @@ mod text;
 
 pub(crate) use dimensions::explode_dimension_with_style;
 use dimensions::*;
+pub(crate) use hatch::hatch_area;
 use leaders::*;
 use meshes::*;
 use modeler::*;
@@ -422,7 +423,7 @@ fn explode_hatch(hatch: &Hatch) -> Vec<EntityType> {
                     let (sa, ea) = if arc_edge.counter_clockwise {
                         (arc_edge.start_angle, arc_edge.end_angle)
                     } else {
-                        (arc_edge.end_angle, arc_edge.start_angle)
+                        (-arc_edge.end_angle, -arc_edge.start_angle)
                     };
                     result.push(EntityType::Arc(Arc {
                         common: inherit_common(common),

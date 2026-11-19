@@ -15,7 +15,12 @@ impl<'a> DwgObjectWriter<'a> {
         } else {
             self.class_type_code(object.dxf_name(), 500)
         };
-        if matches!(&object.data, ClassObjectData::ViewRep(_)) {
+        if matches!(
+            &object.data,
+            ClassObjectData::ViewRep(_)
+                | ClassObjectData::ObjectDataDescriptor(_)
+                | ClassObjectData::ObjectDataRecord(_)
+        ) {
             self.write_common_non_entity_data_relative_owner(
                 type_code,
                 object.handle,
@@ -36,18 +41,26 @@ impl<'a> DwgObjectWriter<'a> {
         self.register_object(object.handle);
     }
 
+    /// Map 3D's `CIrdBaseRecord`, whose length counts two bytes more than
+    /// the payload it stores.
+    fn write_object_data_payload(&mut self, record: bool, payload: &[u8]) {
+        self.writer.write_bit_short(516);
+        self.writer.write_bit_long(record as i32);
+        self.writer.write_bit_long(0);
+        self.writer.write_bit_long(payload.len() as i32 + 2);
+        self.writer.write_bytes(payload);
+    }
+
     /// `write_predefined_bit`: see `read_render_settings` in the reader; only
     /// plain RENDERSETTINGS carries the R2013+ flag right after
-    /// `display_index`.
+    /// `display_index`, and only it stores its class version one higher.
     fn write_render_settings_data(
         &mut self,
         value: &RenderSettings,
         rapid_rt: bool,
         write_predefined_bit: bool,
     ) {
-        let class_version = if rapid_rt && self.dxf_version == crate::types::DxfVersion::AC1027 {
-            value.class_version - 1
-        } else if !rapid_rt && self.version.r2013_plus(self.dxf_version) {
+        let class_version = if !rapid_rt && write_predefined_bit {
             value.class_version + 1
         } else {
             value.class_version
@@ -261,6 +274,35 @@ impl<'a> DwgObjectWriter<'a> {
 
     fn write_class_object_data(&mut self, data: &ClassObjectData) {
         match data {
+            ClassObjectData::ObjectDataDictionary(value) => {
+                // Map sorts the entries by key: *A1, *A10, ..., *A2.
+                let mut entries: Vec<_> = value
+                    .entries
+                    .iter()
+                    .filter(|(_, handle)| self.is_writable_object(handle))
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                self.writer.write_bit_long(entries.len() as i32);
+                self.writer.write_bit_short(value.duplicate_cloning);
+                self.writer.write_byte(value.hard_owner as u8);
+                for (name, handle) in entries {
+                    self.writer.write_variable_text(name);
+                    self.writer
+                        .write_handle(DwgReferenceType::SoftOwnership, handle.value());
+                }
+                self.writer.write_bit_double(0.0);
+            }
+            ClassObjectData::ObjectDataDescriptor(value) => {
+                self.write_object_data_payload(false, &value.payload);
+                self.writer.write_bit_long(value.kind);
+                self.writer.write_variable_text(&value.name);
+                self.writer.write_bit_long(0);
+            }
+            ClassObjectData::ObjectDataRecord(value) => {
+                self.write_object_data_payload(true, &value.payload);
+                self.writer
+                    .write_handle(DwgReferenceType::SoftPointer, value.table.value());
+            }
             ClassObjectData::Empty => {}
             ClassObjectData::ViewRepModelSpaceSource(value) => {
                 self.writer.write_bit(value.enabled);
@@ -757,7 +799,15 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_variable_text(&value.description);
                 self.writer.write_variable_text(&value.tooltip);
                 self.writer.write_variable_text(&value.connection_string);
-                self.writer.write_bit_long(value.option);
+                // Bit 8 of the DWG option says the data map follows, and AutoCAD refuses a link
+                // whose bit and map disagree.
+                let has_data_map = !value.data_map.is_empty();
+                let option = if has_data_map {
+                    value.option | DataLink::HAS_DATA_MAP
+                } else {
+                    value.option & !DataLink::HAS_DATA_MAP
+                };
+                self.writer.write_bit_long(option);
                 self.writer.write_bit_long(value.update_option);
                 self.writer.write_bit_long(value.flags);
                 self.writer.write_bit_short(value.year);
@@ -771,10 +821,17 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_long(value.status_flags);
                 self.writer.write_variable_text(&value.update_status);
                 self.writer.write_bit_long(value.custom_data.len() as i32);
+                // The connected objects (the tables the link feeds) are
+                // pointers: they belong to their own block records.
                 for item in &value.custom_data {
                     self.writer
-                        .write_handle(DwgReferenceType::HardOwnership, item.target.value());
-                    self.writer.write_variable_text(&item.value);
+                        .write_handle(DwgReferenceType::SoftPointer, item.target.value());
+                }
+                if has_data_map {
+                    self.writer.write_bit_long(value.data_map.len() as i32);
+                    for item in &value.data_map {
+                        self.write_table_custom_data(item);
+                    }
                 }
                 self.writer
                     .write_handle(DwgReferenceType::HardOwnership, value.hard_owner.value());
@@ -939,5 +996,191 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_short(value.class_version);
             }
         }
+    }
+}
+
+/// Map 3D Object Data as Civil 3D 2027 saves it to DWG: a drawing's type
+/// dictionary and its five built-in types, which every drawing with Object
+/// Data holds the same.
+#[cfg(test)]
+mod object_data_tests {
+    use super::*;
+    use crate::classes::DxfClass;
+    use crate::document::CadDocument;
+    use crate::objects::object_data::built_in_descriptors;
+    use crate::types::{DxfVersion, Handle};
+
+    const CIVIL3D: [(u64, u64, &str); 6] = [
+        // IRD_DSC_DICT, handle 139
+        (139, 10, concat!(
+            "410062E40643D01009032A0041003100410A8010400C400C001042A00410031003100410A8010400C400C801042A0041",
+            "0031003300410A8010400C400D001042A0041003100350040CA8010400C801032A004100330040CA8010400D001032A0",
+            "04100350040CA8010400D801032A004100370040CA8010400E001032A0041003900C603A085208510C610CA90CB10CB9",
+            "0CC10CC90CD10C690C710C790C810C890C910C990CA7",
+        )),
+        // IRD_DSC_RECORD, handle 140
+        (140, 139, concat!(
+            "41406324060100A9720115000043006C0061007300730000004900720064000000000049007200640000005400680065",
+            "002000620061007300650020007300750070006500720063006C006100730073000000490072006400200043006C0061",
+            "007300730020005600200031002E003000320000000000000000454000242D0C01B0018401CC01CC00B4017C00B40124",
+            "01C8019002E803008317",
+        )),
+        // IRD_DSC_RECORD, handle 141
+        (141, 139, concat!(
+            "41406364060100A9A20117000043006C006100730073004E0075006D0065007200690063000000490072006400000043",
+            "006C006100730073000000490072006400000054006800650020006200610073006500200063006C0061007300730020",
+            "0066006F007200200074006800650020006E0075006D00650072006900630073000000490072006400200043006C0061",
+            "007300730020005600200031002E00300032000000000000000045C00024490C01B0018401CC01CC013801D401B40194",
+            "01C801A4018C00B4017C00B4012401C8019000A80782048317",
+        )),
+        // IRD_DSC_RECORD, handle 142
+        (142, 139, concat!(
+            "414063A4060100A9880116000043006C006100730073005200650061006C000000490072006400000043006C00610073",
+            "0073004E0075006D0065007200690063000000490072006400000054006800650020007200650061006C002000760061",
+            "006C00750065000000490072006400200043006C0061007300730020005600200031002E003000320000000000000000",
+            "458000243D0C01B0018401CC01CC01480194018401B000B4017C00B4012401C8019003E80382068317",
+        )),
+        // IRD_DSC_RECORD, handle 143
+        (143, 139, concat!(
+            "414063E4060100A9880116000043006C006100730073004C006F006E0067000000490072006400000043006C00610073",
+            "0073004E0075006D0065007200690063000000490072006400000054006800650020006C006F006E0067002000760061",
+            "006C00750065000000490072006400200043006C0061007300730020005600200031002E003000320000000000000000",
+            "458000243D0C01B0018401CC01CC013001BC01B8019C00B4017C00B4012401C8019003E80382088317",
+        )),
+        // IRD_DSC_RECORD, handle 144
+        (144, 139, concat!(
+            "41406424060100A9840116000043006C0061007300730043006800610072000000490072006400000043006C00610073",
+            "0073000000490072006400000054006800650020006300680061007200610063007400650072002000760061006C0075",
+            "0065000000490072006400200043006C0061007300730020005600200031002E00300032000000000000000045800024",
+            "3D0C01B0018401CC01CC010C01A0018401C800B4017C00B4012401C8019003E803820A8317",
+        )),
+    ];
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn objects() -> Vec<ClassObject> {
+        let dictionary = Handle::new(CIVIL3D[0].0);
+        let entries = (1..=15)
+            .map(|i| (format!("*A{i}"), Handle::new(dictionary.value() + i)))
+            .collect();
+        let object = |handle: u64, owner: u64, data| ClassObject {
+            handle: Handle::new(handle),
+            owner: Handle::new(owner),
+            reactors: vec![Handle::new(owner)],
+            xdictionary_handle: None,
+            data,
+        };
+        let mut objects = vec![object(
+            CIVIL3D[0].0,
+            CIVIL3D[0].1,
+            ClassObjectData::ObjectDataDictionary(ObjectDataDictionary {
+                entries,
+                ..ObjectDataDictionary::default()
+            }),
+        )];
+        for ((handle, owner, _), descriptor) in CIVIL3D[1..].iter().zip(built_in_descriptors()) {
+            objects.push(object(
+                *handle,
+                *owner,
+                ClassObjectData::ObjectDataDescriptor(descriptor),
+            ));
+        }
+        objects
+    }
+
+    #[test]
+    fn object_data_matches_civil3d() {
+        let mut document = CadDocument::with_version(DxfVersion::AC1032);
+        for (number, (name, cpp)) in [
+            ("IRD_DSC_DICT", "CIrdDscDict"),
+            ("IRD_DSC_RECORD", "CIrdDscRecord"),
+            ("IRD_OBJ_RECORD", "CIrdObjRecord"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut class = DxfClass::new(name, cpp);
+            class.class_number = 500 + number as i16;
+            document.classes.push_preserving(class);
+        }
+        let objects = objects();
+        // The dictionary's other ten entries are tables, which only need to exist.
+        for handle in CIVIL3D[0].0 + 6..=CIVIL3D[0].0 + 15 {
+            let mut table = objects[1].clone();
+            table.handle = Handle::new(handle);
+            document
+                .objects
+                .insert(table.handle, ObjectType::ClassObject(table));
+        }
+        for object in &objects {
+            document
+                .objects
+                .insert(object.handle, ObjectType::ClassObject(object.clone()));
+        }
+        for (object, (_, _, civil3d)) in objects.iter().zip(CIVIL3D) {
+            let mut writer = DwgObjectWriter::new(&document).unwrap();
+            let start = writer.output.len();
+            writer.write_class_object(object);
+            let written = &writer.output[start..];
+            let civil3d = hex(civil3d);
+            let (body, last) = civil3d.split_at(civil3d.len() - 1);
+            let at = written
+                .windows(body.len())
+                .position(|window| window == body)
+                .unwrap_or_else(|| panic!("{} differs from Civil 3D", object.dxf_name()));
+            // Civil 3D pads the record's last byte with ones, this crate with zeros.
+            let padding = last[0] ^ written[at + body.len()];
+            assert_eq!(
+                padding & padding.wrapping_add(1),
+                0,
+                "{}",
+                object.dxf_name()
+            );
+            assert_eq!(
+                written[at + body.len()] & padding,
+                0,
+                "{}",
+                object.dxf_name()
+            );
+        }
+    }
+
+    #[test]
+    fn mental_ray_class_version_is_not_shifted_from_r2013() {
+        // From R2010 on the object's data stream has the same layout and its
+        // strings go to the string stream, so the same object must give the
+        // same data bits at R2010 and R2018; a shifted class version breaks
+        // that.
+        let object = ClassObject {
+            handle: Handle::new(0x80),
+            owner: Handle::new(0x7F),
+            reactors: vec![Handle::new(0x7F)],
+            xdictionary_handle: None,
+            data: ClassObjectData::MentalRayRenderSettings(MentalRayRenderSettings {
+                base: RenderSettings {
+                    class_version: 2,
+                    name: "Draft".into(),
+                    ..RenderSettings::default()
+                },
+                version: 2,
+                ..MentalRayRenderSettings::default()
+            }),
+        };
+        let write = |version| {
+            let mut document = CadDocument::with_version(version);
+            document
+                .objects
+                .insert(object.handle, ObjectType::ClassObject(object.clone()));
+            let mut writer = DwgObjectWriter::new(&document).unwrap();
+            writer.writer.reset();
+            writer.write_class_object_data(&object.data);
+            writer.writer.main().to_bytes_snapshot()
+        };
+        assert_eq!(write(DxfVersion::AC1024), write(DxfVersion::AC1032));
     }
 }

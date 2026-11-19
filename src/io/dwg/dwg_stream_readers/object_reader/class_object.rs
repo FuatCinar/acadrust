@@ -14,18 +14,18 @@ fn count(value: i32, reader: &DwgMergedReader) -> usize {
 /// MENTALRAYRENDERSETTINGS (its body starts right after `display_index`;
 /// consuming a bit there shifted every following field) nor for
 /// RAPIDRTRENDERSETTINGS, which stores the flag after its own fields.
+///
+/// Only plain RENDERSETTINGS stores its class version one higher from R2013
+/// on (the same objects that carry the flag); MENTALRAYRENDERSETTINGS and
+/// RAPIDRTRENDERSETTINGS keep the stored value in every version.
 fn read_render_settings(
     reader: &mut DwgMergedReader,
-    version: DwgVersion,
-    dxf_version: DxfVersion,
     rapid_rt: bool,
     read_predefined_bit: bool,
 ) -> RenderSettings {
     let stored_version = reader.read_bit_long();
     RenderSettings {
-        class_version: if rapid_rt && dxf_version == DxfVersion::AC1027 {
-            stored_version + 1
-        } else if !rapid_rt && version.r2013_plus(dxf_version) {
+        class_version: if !rapid_rt && read_predefined_bit {
             stored_version - 1
         } else {
             stored_version
@@ -328,6 +328,19 @@ fn read_view_rep(reader: &mut DwgMergedReader) -> ViewRep {
     }
 }
 
+/// Map 3D's `CIrdBaseRecord`, whose length counts two bytes more than the
+/// payload it stores.
+fn read_object_data_payload(reader: &mut DwgMergedReader) -> Option<Vec<u8>> {
+    reader.read_bit_short();
+    reader.read_bit_long();
+    reader.read_bit_long();
+    let length = usize::try_from(reader.read_bit_long().checked_sub(2)?).ok()?;
+    if (length as i64).saturating_mul(8) > reader.main_remaining_bits() {
+        return None;
+    }
+    Some(reader.read_bytes(length))
+}
+
 pub fn read_class_object_data(
     reader: &mut DwgMergedReader,
     dxf_name: &str,
@@ -336,6 +349,40 @@ pub fn read_class_object_data(
 ) -> Option<ClassObjectData> {
     let name = dxf_name.to_uppercase();
     let data = match name.as_str() {
+        "IRD_DSC_DICT" => {
+            let entry_count = count(reader.read_bit_long(), reader);
+            let duplicate_cloning = reader.read_bit_short();
+            let hard_owner = reader.read_byte() != 0;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                let name = reader.read_variable_text();
+                entries.push((name, Handle::from(reader.read_handle())));
+            }
+            reader.read_bit_double();
+            ClassObjectData::ObjectDataDictionary(ObjectDataDictionary {
+                entries,
+                duplicate_cloning,
+                hard_owner,
+            })
+        }
+        "IRD_DSC_RECORD" => {
+            let payload = read_object_data_payload(reader)?;
+            let kind = reader.read_bit_long();
+            let name = reader.read_variable_text();
+            reader.read_bit_long();
+            ClassObjectData::ObjectDataDescriptor(ObjectDataDescriptor {
+                kind,
+                name,
+                payload,
+            })
+        }
+        "IRD_OBJ_RECORD" => {
+            let payload = read_object_data_payload(reader)?;
+            ClassObjectData::ObjectDataRecord(ObjectDataRecord {
+                table: Handle::from(reader.read_handle()),
+                payload,
+            })
+        }
         "ACDBVIEWREPMODELSPACESOURCE" => {
             let enabled = reader.read_bit();
             let header_values = [
@@ -547,13 +594,11 @@ pub fn read_class_object_data(
         }),
         "RENDERSETTINGS" => ClassObjectData::RenderSettings(read_render_settings(
             reader,
-            version,
-            dxf_version,
             false,
             version.r2013_plus(dxf_version),
         )),
         "MENTALRAYRENDERSETTINGS" => {
-            let base = read_render_settings(reader, version, dxf_version, false, false);
+            let base = read_render_settings(reader, false, false);
             ClassObjectData::MentalRayRenderSettings(MentalRayRenderSettings {
                 base,
                 version: reader.read_bit_long(),
@@ -610,7 +655,7 @@ pub fn read_class_object_data(
             })
         }
         "RAPIDRTRENDERSETTINGS" => {
-            let mut base = read_render_settings(reader, version, dxf_version, true, false);
+            let mut base = read_render_settings(reader, true, false);
             let rapid_version = reader.read_bit_long();
             let render_target = reader.read_bit_long();
             let render_level = reader.read_bit_long();
@@ -948,12 +993,23 @@ pub fn read_class_object_data(
             let status_flags = reader.read_bit_long();
             let update_status = reader.read_variable_text();
             let mut custom_data = Vec::new();
+            // The connected objects are bare handles; the strings above
+            // are all the link's text.
             for _ in 0..count(reader.read_bit_long(), reader) {
                 custom_data.push(DataLinkCustomData {
                     target: Handle::from(reader.read_handle()),
-                    value: reader.read_variable_text(),
+                    value: String::new(),
                 });
             }
+            // Bit 8 of the DWG option says the data map follows: a custom data collection
+            // (count, then name and value). AutoCAD shows the option without it (DXF, entget).
+            let mut data_map = Vec::new();
+            if option & DataLink::HAS_DATA_MAP != 0 {
+                for _ in 0..count(reader.read_bit_long(), reader) {
+                    data_map.push(super::entities::read_custom_table_data(reader, version));
+                }
+            }
+            let option = option & !DataLink::HAS_DATA_MAP;
             ClassObjectData::DataLink(DataLink {
                 data_adapter,
                 description,
@@ -973,6 +1029,7 @@ pub fn read_class_object_data(
                 status_flags,
                 update_status,
                 custom_data,
+                data_map,
                 hard_owner: Handle::from(reader.read_handle()),
             })
         }

@@ -9,19 +9,40 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     fn write_assoc_header(&mut self, value: &AssociativeObject) -> Result<()> {
         self.writer.write_string(0, &value.dxf_name)?;
         self.writer.write_handle(5, value.handle)?;
-        if !value.reactors.is_empty() {
+        // Reactors, the xdictionary and the owner are filtered the way
+        // `write_common_entity_data` and `write_dictionary` filter theirs: a
+        // reference to an object this writer skips (an Unknown record with no
+        // DXF form, a purge preventer, an Arch entity) resolves to nothing, and
+        // readers report it on audit.
+        let reactors: std::borrow::Cow<'_, [Handle]> = if self.valid_handles.is_empty() {
+            std::borrow::Cow::Borrowed(&value.reactors)
+        } else {
+            std::borrow::Cow::Owned(
+                value
+                    .reactors
+                    .iter()
+                    .copied()
+                    .filter(|reactor| self.handle_is_writable(*reactor))
+                    .collect(),
+            )
+        };
+        if !reactors.is_empty() {
             self.writer.write_string(102, "{ACAD_REACTORS")?;
-            for reactor in &value.reactors {
+            for reactor in reactors.as_ref() {
                 self.writer.write_handle(330, *reactor)?;
             }
             self.writer.write_string(102, "}")?;
         }
-        if let Some(xdictionary) = value.xdictionary_handle {
+        if let Some(xdictionary) = value
+            .xdictionary_handle
+            .filter(|xdictionary| self.handle_is_writable(*xdictionary))
+        {
             self.writer.write_string(102, "{ACAD_XDICTIONARY")?;
             self.writer.write_handle(360, xdictionary)?;
             self.writer.write_string(102, "}")?;
         }
-        self.writer.write_handle(330, value.owner)?;
+        self.writer
+            .write_handle(330, self.safe_object_owner(value.owner))?;
         Ok(())
     }
 
@@ -736,16 +757,21 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 }
                 self.writer.write_double(40, reference.osnap_distance)?;
                 self.writer.write_point3d(10, reference.osnap_point)?;
-                if reference.osnap_type == 6 || reference.osnap_type == 11 {
+                if AssocDimensionReference::stores_intersection(reference.osnap_type) {
                     for object in &reference.intersection_objects {
                         self.writer.write_handle(332, *object)?;
                     }
-                    self.writer
-                        .write_i32(74, reference.intersection_subent_type)?;
-                    self.writer
-                        .write_i32(92, reference.intersection_gs_marker)?;
-                    for path in &reference.intersection_xref_paths {
-                        self.writer.write_string(302, path)?;
+                    if AssocDimensionReference::stores_intersection_subentity(
+                        reference.osnap_type,
+                        reference.intersection_objects.len(),
+                    ) {
+                        self.writer
+                            .write_i32(74, reference.intersection_subent_type)?;
+                        self.writer
+                            .write_i32(92, reference.intersection_gs_marker)?;
+                        for path in &reference.intersection_xref_paths {
+                            self.writer.write_string(302, path)?;
+                        }
                     }
                 }
                 self.writer.write_bool(75, index + 1 < references.len())?;
@@ -838,16 +864,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 )?;
                 self.writer.write_handle(330, value.parameter)?;
                 self.writer.write_bool(290, value.has_action)?;
-                self.writer.write_i32(90, value.action_type)?;
-                for item in &value.curve {
-                    match item {
-                        AssocCurveValue::Bool(value) => self.writer.write_bool(70, *value)?,
-                        AssocCurveValue::Int(value) => self.writer.write_i32(90, *value)?,
-                        AssocCurveValue::Real(value) => self.writer.write_double(40, *value)?,
-                        AssocCurveValue::Point(value) => {
-                            self.writer.write_double(10, value.x)?;
-                            self.writer.write_double(20, value.y)?;
-                            self.writer.write_double(30, value.z)?;
+                // A detached edge stores no cached curve after the flag.
+                if value.has_action {
+                    self.writer.write_i32(90, value.action_type)?;
+                    for item in &value.curve {
+                        match item {
+                            AssocCurveValue::Bool(value) => self.writer.write_bool(70, *value)?,
+                            AssocCurveValue::Int(value) => self.writer.write_i32(90, *value)?,
+                            AssocCurveValue::Real(value) => self.writer.write_double(40, *value)?,
+                            AssocCurveValue::Point(value) => {
+                                self.writer.write_double(10, value.x)?;
+                                self.writer.write_double(20, value.y)?;
+                                self.writer.write_double(30, value.z)?;
+                            }
                         }
                     }
                 }

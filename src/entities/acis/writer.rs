@@ -108,10 +108,10 @@ impl SatWriter {
         // v400 output.
         let skip_index: Option<usize> = if version.major < 7 {
             match base_entity_type(&record.entity_type) {
-                "lump" => Some(1),
-                "shell" => Some(2),
-                "body" | "subshell" | "wire" | "face" | "loop" | "vertex" | "coedge" | "edge"
-                | "point" | "transform" | "surface" | "curve" | "pcurve" => Some(0),
+                "body" | "lump" | "shell" | "subshell" | "wire" | "face" | "loop" | "vertex"
+                | "coedge" | "edge" | "point" | "transform" | "surface" | "curve" | "pcurve" => {
+                    Some(0)
+                }
                 _ => None,
             }
         } else {
@@ -172,7 +172,7 @@ impl SatWriter {
 ///
 /// Uses scientific notation (e.g. `9.9999999999999995e-007`) for very
 /// small or very large values, matching the ACIS convention.
-fn format_float(v: f64) -> String {
+pub(crate) fn format_float(v: f64) -> String {
     if v == 0.0 {
         // A negative zero keeps its sign, as the reference application writes it.
         if v.is_sign_negative() { "-0" } else { "0" }.to_string()

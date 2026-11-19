@@ -250,6 +250,121 @@ fn scan_bmp(data: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+// ── Metafile (EMF/WMF) fallback raster ──────────────────────────────────────
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for n in 0..256u32 {
+        let mut c = n;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        table[n as usize] = c;
+    }
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// Returns the length of a COMPLETE, CRC-valid PNG that starts at `d[0]`
+/// (signature .. IEND), or None if the PNG is truncated / corrupt.
+fn valid_png_len(d: &[u8]) -> Option<usize> {
+    if d.len() < 8 || d[..8] != [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return None;
+    }
+    let mut pos = 8usize;
+    let mut saw_idat = false;
+    loop {
+        if pos + 12 > d.len() {
+            return None;
+        }
+        let len = u32::from_be_bytes(d[pos..pos + 4].try_into().unwrap()) as usize;
+        let end = pos.checked_add(12)?.checked_add(len)?;
+        if end > d.len() {
+            return None;
+        }
+        let crc = u32::from_be_bytes(d[end - 4..end].try_into().unwrap());
+        if crc32_ieee(&d[pos + 4..end - 4]) != crc {
+            return None;
+        }
+        let ty = &d[pos + 4..pos + 8];
+        if ty == b"IDAT" {
+            saw_idat = true;
+        }
+        pos = end;
+        if ty == b"IEND" {
+            return if saw_idat { Some(pos) } else { None };
+        }
+    }
+}
+
+/// EMF/WMF presentations cannot be drawn directly, but the same OLE blob very
+/// often also carries the picture as (a) a complete PNG or (b) a plain
+/// BITMAPINFOHEADER DIB (e.g. inside a WMF DIBSTRETCHBLT record).
+/// Some writers leave a TRUNCATED PNG inside EMF+ records next to a good DIB,
+/// so PNGs are accepted only if every chunk CRC is valid and IEND is present.
+/// Returns (extension, file bytes).
+pub fn fallback_raster(data: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    // (a) complete, valid PNG (largest wins)
+    let sig = [0x89u8, b'P', b'N', b'G'];
+    let mut best_png: Option<&[u8]> = None;
+    let mut i = 0usize;
+    while i + 8 <= data.len() {
+        if data[i..i + 4] == sig {
+            if let Some(n) = valid_png_len(&data[i..]) {
+                if best_png.map_or(true, |b| n > b.len()) {
+                    best_png = Some(&data[i..i + n]);
+                }
+                i += n;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if let Some(b) = best_png {
+        return Some(("png", b.to_vec()));
+    }
+    // (b) uncompressed 24/32-bit DIB with a fully present pixel block
+    let mut best: Option<(usize, usize, u16)> = None; // (offset, total_len, bitcount) by area
+    let mut best_area = 0u64;
+    let mut i = 0usize;
+    while i + 40 <= data.len() {
+        if data[i] == 40 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 0 {
+            let w = i32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap());
+            let h = i32::from_le_bytes(data[i + 8..i + 12].try_into().unwrap());
+            let planes = u16::from_le_bytes(data[i + 12..i + 14].try_into().unwrap());
+            let bpp = u16::from_le_bytes(data[i + 14..i + 16].try_into().unwrap());
+            let comp = u32::from_le_bytes(data[i + 16..i + 20].try_into().unwrap());
+            let ha = h.unsigned_abs() as u64;
+            if planes == 1 && (bpp == 24 || bpp == 32) && comp == 0
+                && w > 0 && w <= 8192 && ha > 0 && ha <= 8192
+            {
+                let stride = ((w as u64 * bpp as u64 + 31) / 32) * 4;
+                let total = 40u64 + stride * ha;
+                if i as u64 + total <= data.len() as u64 {
+                    let area = w as u64 * ha;
+                    if area > best_area {
+                        best_area = area;
+                        best = Some((i, total as usize, bpp));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let (off, total, _) = best?;
+    let dib = &data[off..off + total];
+    let mut out = Vec::with_capacity(14 + total);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((14 + total) as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(dib);
+    Some(("bmp", out))
+}
+
 // ── WMFC → EMF reassembly ───────────────────────────────────────────────────
 
 /// Iterate WMF records as `(function, params)` slices. `off` must point at

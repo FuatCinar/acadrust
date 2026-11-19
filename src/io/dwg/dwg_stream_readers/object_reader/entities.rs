@@ -824,13 +824,39 @@ pub fn read_layout_print_config(reader: &mut DwgMergedReader) -> ExtendedEntityD
     })
 }
 
-pub fn read_proxy_entity(
+/// Fields of a proxy entity or object (ACAD_PROXY_ENTITY, ACAD_PROXY_OBJECT)
+/// that come before its data.
+pub(crate) struct ProxyFields {
+    pub class_id: i32,
+    pub dxf_subclass: String,
+    pub version: i32,
+    pub dwg_version: i32,
+    pub maintenance_version: i32,
+    pub from_dxf: bool,
+}
+
+/// Reads the fields of a proxy record before its data (ODA specification
+/// 20.4.90). From R2000 they are the class number (DXF 91), the R2004+ class
+/// name, the data format (DXF 95; version and maintenance version apart from
+/// R2018) and the origin bit (DXF 70). R13 and R14 store the record type
+/// (DXF 90, 498 or 499) and the class number: their data has no format of its
+/// own and no origin bit, so these are left 0 and `false`.
+pub(crate) fn read_proxy_fields(
     reader: &mut DwgMergedReader,
     version: DwgVersion,
     dxf_version: DxfVersion,
-    proxy_data: Vec<u8>,
-    current_handle: u64,
-) -> ExtendedEntityData {
+) -> ProxyFields {
+    if !version.r2000_plus() {
+        let _record_type = reader.read_bit_long();
+        return ProxyFields {
+            class_id: reader.read_bit_long(),
+            dxf_subclass: String::new(),
+            version: 0,
+            dwg_version: 0,
+            maintenance_version: 0,
+            from_dxf: false,
+        };
+    }
     let class_id = reader.read_bit_long();
     let dxf_subclass = if dxf_version > DxfVersion::AC1015 {
         reader.read_variable_text()
@@ -845,11 +871,31 @@ pub fn read_proxy_entity(
         let combined = reader.read_bit_long();
         (combined, combined & 0xffff, combined >> 16)
     };
-    let from_dxf = if version.r2000_plus() {
-        reader.read_bit()
-    } else {
-        false
-    };
+    ProxyFields {
+        class_id,
+        dxf_subclass,
+        version: version_value,
+        dwg_version,
+        maintenance_version,
+        from_dxf: reader.read_bit(),
+    }
+}
+
+pub fn read_proxy_entity(
+    reader: &mut DwgMergedReader,
+    version: DwgVersion,
+    dxf_version: DxfVersion,
+    proxy_data: Vec<u8>,
+    current_handle: u64,
+) -> ExtendedEntityData {
+    let ProxyFields {
+        class_id,
+        dxf_subclass,
+        version: version_value,
+        dwg_version,
+        maintenance_version,
+        from_dxf,
+    } = read_proxy_fields(reader, version, dxf_version);
     let (payload, text_payload, object_ids) = read_proxy_payload(reader, current_handle);
     if let Some(envelope) =
         crate::objects::semantic_property::decode_registered_class_envelope(&payload)
@@ -887,7 +933,10 @@ pub(crate) fn read_proxy_payload(
 ) {
     let object_data_bits = reader.main_remaining_bits() as u32;
     let mut object_data = vec![0u8; object_data_bits.div_ceil(8) as usize];
-    for bit_index in 0..object_data_bits as usize {
+    let whole = object_data_bits as usize / 8;
+    let bytes = reader.read_bytes(whole);
+    object_data[..bytes.len()].copy_from_slice(&bytes);
+    for bit_index in whole * 8..object_data_bits as usize {
         if reader.read_bit() {
             object_data[bit_index / 8] |= 0x80 >> (bit_index % 8);
         }
@@ -1165,6 +1214,11 @@ pub fn read_insert(reader: &mut DwgMergedReader, version: DwgVersion) -> InsertD
     let rotation = reader.read_bit_double();
     let normal = reader.read_3bit_double();
     let has_attribs = reader.read_bit();
+    if version.r2004_plus() && has_attribs {
+        // R2004+: owned object count (BL). The ATTRIBs themselves are
+        // attached through their owner handles by the document builder.
+        let _owned_count = reader.read_bit_long();
+    }
     let block_handle = reader.read_handle();
 
     InsertData {
@@ -1787,7 +1841,14 @@ pub fn read_leader(
 ) -> LeaderData {
     let unknown_bit = reader.read_bit();
     let annotation_type = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        annotation_type,
+        &[0, 1, 2, 3],
+        "read_leader.annotation_type",
+    );
     let path_type = reader.read_bit_short();
+    crate::io::leader_codes::dwg(reader, path_type, &[0, 1], "read_leader.path_type");
 
     let num_pts = safe_count(reader.read_bit_long(), reader);
     let mut vertices = Vec::with_capacity(num_pts as usize);
@@ -2287,6 +2348,8 @@ pub struct Ole2FrameData {
     /// Frame corners decoded from the OLE data blob (see `ole2frame_corners`).
     pub upper_left: Vector3,
     pub lower_right: Vector3,
+    /// The OLE data exactly as stored (see `Ole2Frame::set_payload`).
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -3626,11 +3689,11 @@ fn read_cell_style(reader: &mut DwgMergedReader) -> Option<CellStyle> {
     for _ in 0..nborders {
         let edge = reader.read_bit_long() as u32;
         if matches!(edge, 1 | 2 | 4 | 8 | 0x10 | 0x20) {
-            style.applied_border_edges |= CellEdgeFlags::from_bits_retain(edge);
+            style.applied_border_edges |= CellEdgeFlags::from_grid_line_type(edge);
             let border = read_border(reader);
             match edge {
                 1 => style.top_border = border,
-                2 => style.right_border = border,
+                0x20 => style.right_border = border,
                 4 => style.bottom_border = border,
                 8 => style.left_border = border,
                 _ => style.additional_borders.push((edge, border)),
@@ -3640,7 +3703,10 @@ fn read_cell_style(reader: &mut DwgMergedReader) -> Option<CellStyle> {
     Some(style)
 }
 
-fn read_custom_table_data(reader: &mut DwgMergedReader, version: DwgVersion) -> TableCustomData {
+pub(super) fn read_custom_table_data(
+    reader: &mut DwgMergedReader,
+    version: DwgVersion,
+) -> TableCustomData {
     let name = reader.read_variable_text();
     let value = read_cad_value_with_schema(reader, version, true);
     TableCustomData { name, value }
@@ -3704,7 +3770,9 @@ fn read_table_cell(reader: &mut DwgMergedReader, version: DwgVersion) -> TableCe
         cell.custom_data_items
             .push(read_custom_table_data(reader, version));
     }
-    cell.has_linked_data = reader.read_bit_long() == 1;
+    // Linked-data flags: bit 0 = the cell anchors a linked range (files
+    // store 3 for the anchor).
+    cell.has_linked_data = reader.read_bit_long() & 1 != 0;
     if cell.has_linked_data {
         let handle = reader.read_handle();
         cell.data_link_handle = (handle != 0).then(|| Handle::from(handle));
@@ -3715,6 +3783,15 @@ fn read_table_cell(reader: &mut DwgMergedReader, version: DwgVersion) -> TableCe
     let ncontents = safe_count(reader.read_bit_long(), reader);
     for _ in 0..ncontents {
         cell.contents.push(read_table_cell_content(reader, version));
+    }
+    // The R2010+ cell has no type of its own: a block content makes it a
+    // block cell, as in the DXF reader.
+    if cell
+        .contents
+        .iter()
+        .any(|content| content.content_type == TableCellContentType::Block)
+    {
+        cell.cell_type = CellType::Block;
     }
     cell.style = read_cell_style(reader);
     cell.style_id = reader.read_bit_long();
@@ -3889,9 +3966,8 @@ fn read_table_cell_data(
         _ => {}
     }
 
-    // Per-cell style override block (each conditional gated on the override
-    // flags; the grid line-weight bit gates both the weight and the visibility
-    // read, mirroring the source exactly to stay byte-aligned).
+    // Per-cell style override block: each field is present only when its bit
+    // is set in the override flags.
     if reader.read_bit() {
         let flags = reader.read_bit_long();
         let mut style = CellStyle::new();
@@ -3919,21 +3995,29 @@ fn read_table_cell_data(
         if flags & 0x20 != 0 {
             style.text_height = reader.read_bit_double();
         }
-        // Per edge: colour, line weight, visibility.
-        for (color_bit, lw_bit, border) in [
-            (0x40, 0x400, &mut style.top_border),
-            (0x80, 0x800, &mut style.right_border),
-            (0x100, 0x1000, &mut style.bottom_border),
-            (0x200, 0x2000, &mut style.left_border),
-        ] {
-            if flags & color_bit != 0 {
+        // Per edge (top, right, bottom, left): colour, line weight and
+        // visibility, each under its own bit. A virtual edge (the adjacent
+        // cell holds the shared edge) has no data, whatever its bits say.
+        for (edge, border) in [
+            &mut style.top_border,
+            &mut style.right_border,
+            &mut style.bottom_border,
+            &mut style.left_border,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if cell.virtual_edge & (1 << edge) != 0 {
+                continue;
+            }
+            if flags & (0x40 << edge) != 0 {
                 border.color = reader.read_cm_true_color();
             }
-            if flags & lw_bit != 0 {
+            if flags & (0x400 << edge) != 0 {
                 border.line_weight = crate::types::LineWeight::from_value(reader.read_bit_short());
             }
-            if flags & lw_bit != 0 {
-                border.invisible = reader.read_bit_short() == 0;
+            if flags & (0x4000 << edge) != 0 {
+                border.invisible = reader.read_bit_short() != 0;
             }
         }
         cell.style = Some(style);
@@ -3961,7 +4045,8 @@ fn read_legacy_table_style_override(reader: &mut DwgMergedReader) -> LegacyTable
         value.title_suppressed = Some(reader.read_bit());
     }
     if flags & 0x0002 != 0 {
-        value.header_suppressed = Some(reader.read_bit());
+        // Header suppressed: "always true", no data in DWG.
+        value.header_suppressed = Some(true);
     }
     if flags & 0x0004 != 0 {
         value.flow_direction = Some(reader.read_bit_short());
@@ -4297,6 +4382,7 @@ pub fn read_ole2frame(reader: &mut DwgMergedReader, version: DwgVersion) -> Ole2
         lock_aspect,
         upper_left,
         lower_right,
+        data,
     }
 }
 
@@ -4635,6 +4721,7 @@ pub fn read_multileader(
     let style_handle = reader.read_handle();
     let property_override_flags = reader.read_bit_long() as u32;
     let path_type = reader.read_bit_short();
+    crate::io::leader_codes::dwg(reader, path_type, &[0, 1, 2], "read_multileader.path_type");
     let line_color = reader.read_cm_color();
     let line_type_handle = reader.read_handle();
     let line_weight = reader.read_bit_long();
@@ -4644,11 +4731,41 @@ pub fn read_multileader(
     let arrowhead_handle = reader.read_handle();
     let arrowhead_size = reader.read_bit_double();
     let content_type = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        content_type,
+        &[0, 1, 2, 3],
+        "read_multileader.content_type",
+    );
     let text_style_handle = reader.read_handle();
     let text_left_attachment = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        text_left_attachment,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "read_multileader.text_left_attachment",
+    );
     let text_right_attachment = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        text_right_attachment,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "read_multileader.text_right_attachment",
+    );
     let text_angle_type = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        text_angle_type,
+        &[0, 1, 2],
+        "read_multileader.text_angle_type",
+    );
     let text_alignment = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        text_alignment,
+        &[0, 1, 2],
+        "read_multileader.text_alignment",
+    );
     let text_color = reader.read_cm_color();
     let text_frame = reader.read_bit();
     let block_content_handle = reader.read_handle();
@@ -4656,6 +4773,12 @@ pub fn read_multileader(
     let block_scale = reader.read_3bit_double();
     let block_rotation = reader.read_bit_double();
     let block_connection_type = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        block_connection_type,
+        &[0, 1],
+        "read_multileader.block_connection_type",
+    );
     let enable_annotation_scale = reader.read_bit();
 
     // R2010 introduced per-leader-line appearance fields. Older records omit
@@ -4721,6 +4844,12 @@ pub fn read_multileader(
     let text_direction_negative = reader.read_bit();
     let text_align_in_ipe = reader.read_bit_short();
     let text_attachment_point = reader.read_bit_short();
+    crate::io::leader_codes::dwg(
+        reader,
+        text_attachment_point,
+        &[1, 2, 3],
+        "read_multileader.text_attachment_point",
+    );
     let scale_factor = reader.read_bit_double();
 
     let mut text_attachment_direction: i16 = 0;
@@ -4729,8 +4858,26 @@ pub fn read_multileader(
     if version.r2010_plus() {
         // Order: dir (271), bottom (272), top (273) — per ACAD.
         text_attachment_direction = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            text_attachment_direction,
+            &[0, 1],
+            "read_multileader.text_attachment_direction",
+        );
         text_bottom_attachment = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            text_bottom_attachment,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "read_multileader.text_bottom_attachment",
+        );
         text_top_attachment = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            text_top_attachment,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "read_multileader.text_top_attachment",
+        );
     }
 
     let mut extend_leader_to_text = false;
@@ -4818,10 +4965,42 @@ pub(crate) fn read_multileader_annotation_context(
     let text_height = reader.read_bit_double();
     let arrowhead_size = reader.read_bit_double();
     let landing_gap = reader.read_bit_double();
-    let text_left_attachment = TextAttachmentType::from(reader.read_bit_short());
-    let text_right_attachment = TextAttachmentType::from(reader.read_bit_short());
-    let text_alignment = TextAlignmentType::from(reader.read_bit_short());
-    let block_connection_type = BlockContentConnectionType::from(reader.read_bit_short());
+    let text_left_attachment = TextAttachmentType::from({
+        let code = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            code,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "read_multileader_annotation_context.TextAttachmentType",
+        )
+    });
+    let text_right_attachment = TextAttachmentType::from({
+        let code = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            code,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "read_multileader_annotation_context.TextAttachmentType",
+        )
+    });
+    let text_alignment = TextAlignmentType::from({
+        let code = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            code,
+            &[0, 1, 2],
+            "read_multileader_annotation_context.TextAlignmentType",
+        )
+    });
+    let block_connection_type = BlockContentConnectionType::from({
+        let code = reader.read_bit_short();
+        crate::io::leader_codes::dwg(
+            reader,
+            code,
+            &[0, 1],
+            "read_multileader_annotation_context.BlockContentConnectionType",
+        )
+    });
 
     let has_text_contents = reader.read_bit();
 
@@ -4867,10 +5046,34 @@ pub(crate) fn read_multileader_annotation_context(
         text_width = reader.read_bit_double();
         text_boundary_height = reader.read_bit_double();
         line_spacing_factor = reader.read_bit_double();
-        line_spacing_style = LineSpacingStyle::from(reader.read_bit_short());
+        line_spacing_style = LineSpacingStyle::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[1, 2],
+                "read_multileader_annotation_context.LineSpacingStyle",
+            )
+        });
         text_color = reader.read_cm_color();
-        text_attachment_point = TextAttachmentPointType::from(reader.read_bit_short());
-        text_flow_direction = FlowDirectionType::from(reader.read_bit_short());
+        text_attachment_point = TextAttachmentPointType::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[1, 2, 3],
+                "read_multileader_annotation_context.TextAttachmentPointType",
+            )
+        });
+        text_flow_direction = FlowDirectionType::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[1, 3, 5],
+                "read_multileader_annotation_context.FlowDirectionType",
+            )
+        });
         background_fill_color = reader.read_cm_color();
         background_scale_factor = reader.read_bit_double();
         background_transparency = reader.read_bit_long();
@@ -4939,8 +5142,24 @@ pub(crate) fn read_multileader_annotation_context(
     let mut text_top_attachment = TextAttachmentType::CenterOfText;
     let mut text_bottom_attachment = TextAttachmentType::CenterOfText;
     if version.r2010_plus() {
-        text_top_attachment = TextAttachmentType::from(reader.read_bit_short());
-        text_bottom_attachment = TextAttachmentType::from(reader.read_bit_short());
+        text_top_attachment = TextAttachmentType::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                "read_multileader_annotation_context.TextAttachmentType",
+            )
+        });
+        text_bottom_attachment = TextAttachmentType::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                "read_multileader_annotation_context.TextAttachmentType",
+            )
+        });
     }
 
     MultiLeaderAnnotContext {
@@ -5033,7 +5252,15 @@ fn read_leader_root(
 
     let mut text_attachment_direction = TextAttachmentDirectionType::default();
     if version.r2010_plus() {
-        text_attachment_direction = TextAttachmentDirectionType::from(reader.read_bit_short());
+        text_attachment_direction = TextAttachmentDirectionType::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[0, 1],
+                "read_leader_root.TextAttachmentDirectionType",
+            )
+        });
     }
 
     LeaderRoot {
@@ -5097,7 +5324,15 @@ fn read_leader_line(reader: &mut DwgMergedReader, version: DwgVersion) -> Leader
     let mut override_flags = LeaderLinePropertyOverrideFlags::NONE;
 
     if version.r2010_plus() {
-        path_type = MultiLeaderPathType::from(reader.read_bit_short());
+        path_type = MultiLeaderPathType::from({
+            let code = reader.read_bit_short();
+            crate::io::leader_codes::dwg(
+                reader,
+                code,
+                &[0, 1, 2],
+                "read_leader_line.MultiLeaderPathType",
+            )
+        });
         line_color = reader.read_cm_color();
         let lt_handle = reader.read_handle();
         line_type_handle = if lt_handle != 0 {
@@ -5519,55 +5754,22 @@ fn read_acis_entity_impl(
     let mut silhouettes = Vec::new();
 
     if wireframe_present {
-        // LibreDWG COMMON_3DSOLID: a point_present bit gates the 3BD point.
-        point_present = reader.read_bit();
-        if point_present {
-            point = reader.read_3bit_double();
-        }
-        isolines = reader.read_bit_long();
-        isoline_present = reader.read_bit();
-        if isoline_present {
-            let num_wires = safe_count(reader.read_bit_long(), reader);
-            for _ in 0..num_wires {
-                wires.push(read_wire(reader));
+        // The wire colour is a BS in the drawings of #129 (AutoCAD 2004 and
+        // 2018, checked against ODA) but reads as a BL in others (#356,
+        // AutoCAD 2025, as LibreDWG has it from R2004 on). Read it as a BS,
+        // and when that runs the wire block off the rails, read it again
+        // as a BL from the same point.
+        let start = (*reader).clone();
+        let mut frame = read_wireframe(reader, version, false);
+        if reader.check_error().is_err() && version.r2004_plus() {
+            let mut retry = start;
+            let wide = read_wireframe(&mut retry, version, true);
+            if retry.check_error().is_ok() {
+                *reader = retry;
+                frame = wide;
             }
         }
-
-        // The isoline flag gates only the wire array. The silhouette
-        // count is always present in a wireframe block, including zero
-        // when there are no silhouettes (ODA DWG spec, section 20.4.41).
-        let num_silhouettes = safe_count(reader.read_bit_long(), reader);
-        for _ in 0..num_silhouettes {
-            // Native R2010+ silhouettes store a BLL viewport identity.
-            // Earlier records use BL, including compact zero identities.
-            let viewport_id = if version.r2010_plus() {
-                reader.read_bit_long_long()
-            } else {
-                i64::from(reader.read_bit_long())
-            };
-            let target = reader.read_3bit_double();
-            let view_direction = reader.read_3bit_double();
-            let up_vector = reader.read_3bit_double();
-            let is_perspective = reader.read_bit();
-            let mut sil_wires = Vec::new();
-            let has_sil_wires = reader.read_bit();
-            if has_sil_wires {
-                let num_sw = safe_count(reader.read_bit_long(), reader);
-                sil_wires.reserve(num_sw as usize);
-                for _ in 0..num_sw {
-                    sil_wires.push(read_wire(reader));
-                }
-            }
-            silhouettes.push(Silhouette {
-                viewport_id,
-                view_direction,
-                up_vector,
-                target,
-                is_perspective,
-                has_wires: has_sil_wires,
-                wires: sil_wires,
-            });
-        }
+        (point_present, point, isolines, isoline_present, wires, silhouettes) = frame;
     }
 
     // Native pre-R2007 SAT records can end at an absent wireframe flag,
@@ -5742,12 +5944,16 @@ pub fn read_surface(
     has_ds_data: bool,
     kind: SurfaceKind,
 ) -> SurfaceEntityData {
+    // The optional extra modeler block belongs to AcDs-backed (R2013+) surfaces.
+    // On inline pre-R2013 ACIS surfaces, the next fields are the surface isoline counts;
+    // probing them inside read_acis_entity_impl shifts the record by one bit.
+    let allow_extra = has_ds_data || version.r2013_plus(dxf_version);
     let Some(mut acis) = read_acis_entity_impl(
         reader,
         version,
         dxf_version,
         has_ds_data,
-        false,
+        allow_extra,
         false,
         None,
     ) else {
@@ -5974,10 +6180,79 @@ pub fn read_surface(
 /// Field order/types per LibreDWG `Dwg_3DSOLID_wire`:
 /// RC type, BLd selection_marker, BS color, BLd acis_index, BL num_points,
 /// 3BD points…, B transform_present [+ axes/translation/scale/flags].
-fn read_wire(reader: &mut DwgMergedReader) -> Wire {
+/// The wireframe block of an ACIS entity: the point, the isolines, the wires
+/// and the silhouettes. `wide_color` reads each wire colour as a BL.
+#[allow(clippy::type_complexity)]
+fn read_wireframe(
+    reader: &mut DwgMergedReader,
+    version: DwgVersion,
+    wide_color: bool,
+) -> (bool, Vector3, i32, bool, Vec<Wire>, Vec<Silhouette>) {
+    let mut point = Vector3::ZERO;
+    let mut wires = Vec::new();
+    let mut silhouettes = Vec::new();
+    // LibreDWG COMMON_3DSOLID: a point_present bit gates the 3BD point.
+    let point_present = reader.read_bit();
+    if point_present {
+        point = reader.read_3bit_double();
+    }
+    let isolines = reader.read_bit_long();
+    let isoline_present = reader.read_bit();
+    if isoline_present {
+        let num_wires = safe_count(reader.read_bit_long(), reader);
+        for _ in 0..num_wires {
+            wires.push(read_wire(reader, wide_color));
+        }
+    }
+
+    // The isoline flag gates only the wire array. The silhouette
+    // count is always present in a wireframe block, including zero
+    // when there are no silhouettes (ODA DWG spec, section 20.4.41).
+    let num_silhouettes = safe_count(reader.read_bit_long(), reader);
+    for _ in 0..num_silhouettes {
+        // Native R2010+ silhouettes store a BLL viewport identity.
+        // Earlier records use BL, including compact zero identities.
+        let viewport_id = if version.r2010_plus() {
+            reader.read_bit_long_long()
+        } else {
+            i64::from(reader.read_bit_long())
+        };
+        let target = reader.read_3bit_double();
+        let view_direction = reader.read_3bit_double();
+        let up_vector = reader.read_3bit_double();
+        let is_perspective = reader.read_bit();
+        let mut sil_wires = Vec::new();
+        let has_sil_wires = reader.read_bit();
+        if has_sil_wires {
+            let num_sw = safe_count(reader.read_bit_long(), reader);
+            sil_wires.reserve(num_sw as usize);
+            for _ in 0..num_sw {
+                sil_wires.push(read_wire(reader, wide_color));
+            }
+        }
+        silhouettes.push(Silhouette {
+            viewport_id,
+            view_direction,
+            up_vector,
+            target,
+            is_perspective,
+            has_wires: has_sil_wires,
+            wires: sil_wires,
+        });
+    }
+    (point_present, point, isolines, isoline_present, wires, silhouettes)
+}
+
+/// One cached wire of an ACIS entity; `wide_color` reads its colour as a BL
+/// rather than a BS (see `read_wireframe`'s caller).
+fn read_wire(reader: &mut DwgMergedReader, wide_color: bool) -> Wire {
     let wire_type_raw = reader.read_byte();
     let selection_marker = reader.read_bit_long();
-    let color_val = reader.read_bit_short();
+    let color_val = if wide_color {
+        reader.read_bit_long()
+    } else {
+        i32::from(reader.read_bit_short())
+    };
     let acis_index = reader.read_bit_long();
     let num_pts = safe_count(reader.read_bit_long(), reader);
     let mut pts = Vec::with_capacity(num_pts as usize);
@@ -5994,7 +6269,9 @@ fn read_wire(reader: &mut DwgMergedReader) -> Wire {
         y_axis = reader.read_3bit_double();
         z_axis = reader.read_3bit_double();
         translation = reader.read_3bit_double();
-        scale = reader.read_3bit_double();
+        // The scale is one BD (uniform scale), not a 3BD.
+        let uniform = reader.read_bit_double();
+        scale = Vector3::new(uniform, uniform, uniform);
         has_rotation = reader.read_bit();
         has_reflection = reader.read_bit();
         has_shear = reader.read_bit();
@@ -6045,6 +6322,81 @@ mod tests {
         let data = writer.merge();
         let hsb = writer.handle_start_bits();
         DwgMergedReader::new(data, dxf, hsb)
+    }
+
+    /// Writes one wire the way the DWG format defines it: the transform's
+    /// scale is a single BD (uniform scale), not a 3BD. Built from raw
+    /// primitives so it does not depend on `ObjectWriter`.
+    fn write_spec_wire(
+        w: &mut DwgMergedWriter,
+        acis_index: i32,
+        points: &[Vector3],
+        transform: Option<(Vector3, Vector3, Vector3, Vector3, f64, [bool; 3])>,
+    ) {
+        w.write_byte(1); // wire type
+        w.write_bit_long(-7); // selection marker
+        w.write_bit_short(5); // colour
+        w.write_bit_long(acis_index);
+        w.write_bit_long(points.len() as i32);
+        for p in points {
+            w.write_3bit_double(*p);
+        }
+        match transform {
+            None => w.write_bit(false),
+            Some((x, y, z, t, scale, flags)) => {
+                w.write_bit(true);
+                w.write_3bit_double(x);
+                w.write_3bit_double(y);
+                w.write_3bit_double(z);
+                w.write_3bit_double(t);
+                w.write_bit_double(scale); // one BD, not a 3BD
+                for flag in flags {
+                    w.write_bit(flag);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wire_transform_scale_is_one_bit_double_and_the_next_wire_stays_in_sync() {
+        let dwg = DwgVersion::AC24;
+        let dxf = DxfVersion::AC1032;
+        let (x, y, z) = (
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+            Vector3::UNIT_Z,
+        );
+        let t = Vector3::new(10.5, -20.25, 30.125);
+        let first_points = [Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0)];
+        let second_points = [Vector3::new(7.0, 8.0, 9.0)];
+        let mut reader = make_reader(dwg, dxf, |w| {
+            write_spec_wire(
+                w,
+                3,
+                &first_points,
+                Some((x, y, z, t, 2.5, [true, false, true])),
+            );
+            write_spec_wire(w, 4, &second_points, None);
+        });
+
+        let first = read_wire(&mut reader, false);
+        assert_eq!(first.acis_index, 3);
+        assert_eq!(first.selection_marker, -7);
+        assert_eq!(first.points, first_points.to_vec());
+        assert!(first.has_transform);
+        assert_eq!((first.x_axis, first.y_axis, first.z_axis), (x, y, z));
+        assert_eq!(first.translation, t);
+        assert_eq!(first.scale, Vector3::new(2.5, 2.5, 2.5));
+        assert!(first.has_rotation);
+        assert!(!first.has_reflection);
+        assert!(first.has_shear);
+
+        let second = read_wire(&mut reader, false);
+        assert_eq!(second.acis_index, 4);
+        assert_eq!(second.selection_marker, -7);
+        assert_eq!(second.points, second_points.to_vec());
+        assert!(!second.has_transform);
+        reader.check_error().expect("both wires decode cleanly");
     }
 
     #[test]
@@ -6295,6 +6647,35 @@ mod tests {
     }
 
     #[test]
+    fn test_minsert_with_attribs_r2004_reads_the_owned_count() {
+        let v = DwgVersion::AC18;
+        let d = DxfVersion::AC1018;
+        let mut r = make_reader(v, d, |w| {
+            w.write_3bit_double(Vector3::new(100.0, 200.0, 0.0));
+            w.write_2bits(3); // all-ones scale
+            w.write_bit_double(0.0); // rotation
+            w.write_3bit_double(Vector3::UNIT_Z); // normal
+            w.write_bit(true); // has_attribs
+            w.write_bit_long(1); // owned object count (R2004+)
+            w.write_handle(
+                crate::io::dwg::dwg_reference_type::DwgReferenceType::HardPointer,
+                0x50,
+            );
+            w.write_bit_short(2); // columns
+            w.write_bit_short(3); // rows
+            w.write_bit_double(15.0); // column spacing
+            w.write_bit_double(10.0); // row spacing
+        });
+        let m = read_minsert(&mut r, v);
+        assert!(m.insert.has_attribs);
+        assert_eq!(m.insert.block_handle, 0x50);
+        assert_eq!(m.column_count, 2);
+        assert_eq!(m.row_count, 3);
+        assert_eq!(m.column_spacing, 15.0);
+        assert_eq!(m.row_spacing, 10.0);
+    }
+
+    #[test]
     fn test_spline_roundtrip_scenario1() {
         let v = DwgVersion::AC15;
         let d = DxfVersion::AC1015;
@@ -6505,5 +6886,247 @@ mod tests {
             missing_reader.check_error().is_err()
                 || missing_reader.position_in_bits() != missing_end
         );
+    }
+
+    /// `shift` bits are read first, so the payload starts off a byte boundary
+    /// and, for most shifts, ends in trailing bits.
+    fn proxy_reader(dwg: DwgVersion, dxf: DxfVersion, shift: u32, size: usize) -> DwgMergedReader {
+        let mut reader = make_reader(dwg, dxf, |writer| {
+            for _ in 0..shift {
+                writer.write_bit(true);
+            }
+            let bytes: Vec<u8> = (0..size)
+                .map(|i| (i as u8).wrapping_mul(37) ^ 0xA5)
+                .collect();
+            writer.write_bytes(&bytes);
+        });
+        for _ in 0..shift {
+            assert!(reader.read_bit());
+        }
+        reader
+    }
+
+    #[test]
+    fn a_proxy_payload_matches_reading_it_bit_by_bit() {
+        for (dwg, dxf) in [
+            (DwgVersion::AC15, DxfVersion::AC1015),
+            (DwgVersion::AC18, DxfVersion::AC1018),
+        ] {
+            for shift in 0..8 {
+                for size in [0, 1, 2, 16, 257] {
+                    let mut oracle = proxy_reader(dwg, dxf, shift, size);
+                    let bits = oracle.main_remaining_bits() as u32;
+                    let mut expected = vec![0u8; bits.div_ceil(8) as usize];
+                    for bit in 0..bits as usize {
+                        if oracle.read_bit() {
+                            expected[bit / 8] |= 0x80 >> (bit % 8);
+                        }
+                    }
+
+                    let mut reader = proxy_reader(dwg, dxf, shift, size);
+                    let (payload, _, _) = read_proxy_payload(&mut reader, 1);
+                    assert_eq!(
+                        payload,
+                        crate::objects::ProxyPayload::from_bits(&expected, bits),
+                        "{dxf:?} shift {shift} size {size}"
+                    );
+                    assert_eq!(reader.main_remaining_bits(), 0);
+                    assert!(reader.check_error().is_ok());
+                }
+            }
+        }
+    }
+
+    // ── legacy TABLE cell overrides (AcDbTable cell data below R2010) ──
+    //
+    // ODA's Open Design Specification (20.4.96.1): each edge (top, right,
+    // bottom, left) has a color bit 0x40 << i, a line weight bit 0x400 << i
+    // and a visibility bit 0x4000 << i, and an edge set in the virtual edge
+    // byte (RC 178) carries no border data. These encode one text cell that
+    // way, then a sentinel the reader must land on.
+
+    const SENTINEL: i32 = 0x0123_4567;
+
+    fn legacy_cell(
+        dwg: DwgVersion,
+        dxf: DxfVersion,
+        flags: i32,
+        virtual_edge: u8,
+        overrides: impl FnOnce(&mut DwgMergedWriter),
+    ) -> DwgMergedReader {
+        use crate::io::dwg::dwg_reference_type::DwgReferenceType::HardPointer;
+        make_reader(dwg, dxf, |w| {
+            if dwg.r2007_plus() {
+                // The record size, which locates the string stream.
+                w.save_position_for_size();
+            }
+            w.write_bit_short(1); // text cell
+            w.write_byte(0x0F); // edge flags
+            w.write_bit(false); // merged
+            w.write_bit(false); // auto fit
+            w.write_bit_long(1); // merge width
+            w.write_bit_long(1); // merge height
+            w.write_bit_double(0.0); // rotation
+            w.write_handle(HardPointer, 0); // value handle
+            if !dwg.r2007_plus() {
+                w.write_variable_text("cell");
+            }
+            w.write_bit(true); // has override
+            w.write_bit_long(flags);
+            w.write_byte(virtual_edge);
+            overrides(w);
+            if dwg.r2007_plus() {
+                w.write_bit_long(0); // cell flag
+                w.write_bit_long(1); // value flags: no value body
+                w.write_bit_long(4); // string
+                w.write_bit_long(0); // unit type
+                w.write_variable_text(""); // format
+                w.write_variable_text("cell"); // formatted value
+            }
+            w.write_bit_long(SENTINEL);
+        })
+    }
+
+    fn read_legacy_cell(
+        reader: &mut DwgMergedReader,
+        dwg: DwgVersion,
+        dxf: DxfVersion,
+    ) -> CellStyle {
+        if dwg.r2007_plus() {
+            let size = reader.read_raw_long();
+            reader.setup_text_and_handle(size);
+        }
+        let cell = read_table_cell_data(reader, dwg, dxf);
+        assert_eq!(
+            reader.read_bit_long(),
+            SENTINEL,
+            "{dxf:?}: the cell record ends elsewhere"
+        );
+        reader.check_error().expect("cell record");
+        assert_eq!(cell.text_value(), "cell", "{dxf:?}");
+        cell.style.expect("cell style")
+    }
+
+    #[test]
+    fn legacy_cell_edge_visibility_has_its_own_bit() {
+        // Text height, then the visibility of the top, right and left edges,
+        // with no line weight.
+        let flags = 0x20 | 0x4000 | 0x8000 | 0x20000;
+        for (dwg, dxf) in [
+            (DwgVersion::AC18, DxfVersion::AC1018),
+            (DwgVersion::AC21, DxfVersion::AC1021),
+        ] {
+            let mut reader = legacy_cell(dwg, dxf, flags, 0, |w| {
+                w.write_bit_double(2.5);
+                w.write_bit_short(1); // top: invisible
+                w.write_bit_short(0); // right: visible
+                w.write_bit_short(1); // left: invisible
+            });
+            let style = read_legacy_cell(&mut reader, dwg, dxf);
+            assert_eq!(style.override_flags, flags);
+            assert_eq!(style.text_height, 2.5);
+            assert!(style.top_border.invisible, "{dxf:?}: top");
+            assert!(!style.right_border.invisible, "{dxf:?}: right");
+            assert!(!style.bottom_border.invisible, "{dxf:?}: bottom");
+            assert!(style.left_border.invisible, "{dxf:?}: left");
+            for border in [
+                &style.top_border,
+                &style.right_border,
+                &style.bottom_border,
+                &style.left_border,
+            ] {
+                assert_eq!(border.line_weight, LineWeight::ByLayer, "{dxf:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_cell_line_weight_is_read_without_visibility() {
+        let flags = 0x400 | 0x1000; // top and bottom line weights
+        for (dwg, dxf) in [
+            (DwgVersion::AC18, DxfVersion::AC1018),
+            (DwgVersion::AC21, DxfVersion::AC1021),
+        ] {
+            let mut reader = legacy_cell(dwg, dxf, flags, 0, |w| {
+                w.write_bit_short(35);
+                w.write_bit_short(50);
+            });
+            let style = read_legacy_cell(&mut reader, dwg, dxf);
+            assert_eq!(style.top_border.line_weight, LineWeight::from_value(35));
+            assert_eq!(style.bottom_border.line_weight, LineWeight::from_value(50));
+            assert!(!style.top_border.invisible && !style.bottom_border.invisible);
+        }
+    }
+
+    #[test]
+    fn legacy_cell_virtual_edge_carries_no_border_data() {
+        // Color bits on the top and left edges; the top edge is virtual
+        // (its neighbour holds the shared edge), so only the left color is
+        // there.
+        let flags = 0x40 | 0x200;
+        for (dwg, dxf) in [
+            (DwgVersion::AC18, DxfVersion::AC1018),
+            (DwgVersion::AC21, DxfVersion::AC1021),
+        ] {
+            let mut reader = legacy_cell(dwg, dxf, flags, 0x01, |w| {
+                w.write_cm_true_color(&Color::from_index(3));
+            });
+            let style = read_legacy_cell(&mut reader, dwg, dxf);
+            assert_eq!(style.left_border.color, Color::from_index(3), "{dxf:?}");
+            assert_eq!(style.top_border.color, Color::ByBlock, "{dxf:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_cell_virtual_edge_skips_all_three_fields() {
+        // Every field of the virtual bottom edge is flagged, none is stored;
+        // the right edge's visibility follows the text height.
+        let flags = 0x20 | 0x100 | 0x1000 | 0x10000 | 0x8000;
+        for (dwg, dxf) in [
+            (DwgVersion::AC18, DxfVersion::AC1018),
+            (DwgVersion::AC21, DxfVersion::AC1021),
+        ] {
+            let mut reader = legacy_cell(dwg, dxf, flags, 0x04, |w| {
+                w.write_bit_double(1.25);
+                w.write_bit_short(1); // right: invisible
+            });
+            let style = read_legacy_cell(&mut reader, dwg, dxf);
+            assert_eq!(style.text_height, 1.25);
+            assert!(style.right_border.invisible, "{dxf:?}: right");
+            assert!(!style.bottom_border.invisible, "{dxf:?}: bottom");
+            assert_eq!(style.bottom_border.line_weight, LineWeight::ByLayer);
+        }
+    }
+
+    // ── legacy TABLE overrides (BL 93, AcDbTable below R2010) ──
+    //
+    // ODA's Open Design Specification (20.4.96.1): the header suppressed
+    // override (bit 0x0002) is "always true (do not read any data for this)".
+
+    #[test]
+    fn legacy_table_header_suppressed_override_has_no_data() {
+        const SENTINEL: i32 = 0x0123_4567;
+        // Title and header suppressed, both cell margins.
+        let flags = 0x01 | 0x02 | 0x08 | 0x10;
+        for (dwg, dxf) in [
+            (DwgVersion::AC18, DxfVersion::AC1018),
+            (DwgVersion::AC21, DxfVersion::AC1021),
+        ] {
+            let mut reader = make_reader(dwg, dxf, |w| {
+                w.write_bit_long(flags);
+                w.write_bit(true); // title suppressed
+                w.write_bit_double(0.0864); // horizontal cell margin
+                w.write_bit_double(0.0432); // vertical cell margin
+                w.write_bit_long(SENTINEL);
+            });
+            let value = read_legacy_table_style_override(&mut reader);
+            assert_eq!(reader.read_bit_long(), SENTINEL, "{dxf:?}");
+            reader.check_error().expect("table overrides");
+            assert_eq!(value.flags, flags);
+            assert_eq!(value.title_suppressed, Some(true));
+            assert_eq!(value.header_suppressed, Some(true), "{dxf:?}");
+            assert_eq!(value.horizontal_cell_margin, Some(0.0864), "{dxf:?}");
+            assert_eq!(value.vertical_cell_margin, Some(0.0432), "{dxf:?}");
+        }
     }
 }

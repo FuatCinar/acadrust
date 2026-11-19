@@ -233,8 +233,16 @@ pub(crate) fn transform_polyline2d(e: &mut Polyline2D, transform: &Transform) {
     // normal's OCS.
     let new_normal = transform.apply_rotation(e.normal).normalize();
     let (ocs, new_t) = ocs_pair(e.normal, new_normal);
+    // Widths are lengths in the plane: SCALE 2 makes the band twice as wide.
+    let scale_factor = transform
+        .apply_rotation(Vector3::new(1.0, 0.0, 0.0))
+        .length();
+    e.start_width *= scale_factor;
+    e.end_width *= scale_factor;
     for vertex in &mut e.vertices {
         vertex.location = new_t * transform.apply(ocs * vertex.location);
+        vertex.start_width *= scale_factor;
+        vertex.end_width *= scale_factor;
         if flip {
             // Bulge encodes the arc's side/direction in the plane; a
             // reflection reverses it.
@@ -268,11 +276,18 @@ pub(crate) fn transform_lwpolyline(e: &mut LwPolyline, transform: &Transform) {
     // the shared elevation field.
     let plane_origin = new_t * transform.apply(ocs * Vector3::new(0.0, 0.0, e.elevation));
     let new_elevation = plane_origin.z;
+    // Widths are lengths in the plane: SCALE 2 makes the band twice as wide.
+    let scale_factor = transform
+        .apply_rotation(Vector3::new(1.0, 0.0, 0.0))
+        .length();
+    e.constant_width *= scale_factor;
     for vertex in &mut e.vertices {
         let pt3d = Vector3::new(vertex.location.x, vertex.location.y, e.elevation);
         let l = new_t * transform.apply(ocs * pt3d);
         vertex.location.x = l.x;
         vertex.location.y = l.y;
+        vertex.start_width *= scale_factor;
+        vertex.end_width *= scale_factor;
         if flip {
             // Bulge encodes the arc's side/direction in the plane; a
             // reflection reverses it. Without this, exploding a mirrored
@@ -364,8 +379,14 @@ pub(crate) fn transform_mtext(e: &mut MText, transform: &Transform) {
     if let Some(ref mut h) = e.rectangle_height {
         *h *= scale_factor;
     }
+    scale_inline_heights(&mut e.value, scale_factor);
     let new_normal = transform.apply_rotation(old_normal).normalize();
-    let direction = transform.apply_rotation(old_direction);
+    // The x-axis direction is a unit vector: AutoCAD's AUDIT rejects an MTEXT
+    // whose direction carries the scale factor.
+    let mut direction = transform.apply_rotation(old_direction);
+    if direction.length() > 1e-12 {
+        direction = direction.normalize();
+    }
     e.normal = new_normal;
     e.dwg_x_direction = Some(direction);
     if direction.x.abs() > 1e-12 || direction.y.abs() > 1e-12 {
@@ -373,6 +394,40 @@ pub(crate) fn transform_mtext(e: &mut MText, transform: &Transform) {
     } else {
         e.rotation = 0.0;
     }
+}
+
+/// Multiplies every absolute `\H<h>;` height code in MTEXT `contents` by
+/// `factor`; relative `\H<k>x;` codes already follow the entity height.
+pub(crate) fn scale_inline_heights(contents: &mut String, factor: f64) {
+    if (factor - 1.0).abs() < 1e-12 || !contents.contains("\\H") {
+        return;
+    }
+    let mut out = String::with_capacity(contents.len());
+    let mut rest = contents.as_str();
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let next = rest[1..].chars().next();
+        if next == Some('H') {
+            if let Some(end) = rest.find(';') {
+                let value = &rest[2..end];
+                if !value.ends_with(['x', 'X']) {
+                    if let Ok(h) = value.trim().parse::<f64>() {
+                        out.push_str(&format!("\\H{};", h * factor));
+                        rest = &rest[end + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+        // Any other code (or `\\`) is copied with its next char so an
+        // escaped backslash never starts a code.
+        let len = 1 + next.map_or(0, char::len_utf8);
+        out.push_str(&rest[..len]);
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    *contents = out;
 }
 
 // ── Spline ───────────────────────────────────────────────────────────────────
@@ -450,6 +505,11 @@ fn transform_dimension_angle(
     }
 }
 
+/// Whether a transform left a dimension in its own plane.
+fn same_plane(old_normal: Vector3, new_normal: Vector3) -> bool {
+    (old_normal - new_normal).length_squared() < 1e-18
+}
+
 pub(crate) fn transform_dimension(e: &mut Dimension, transform: &Transform) {
     e.base_mut().common.raw_record = None;
     if let Dimension::Ordinate(d) = e {
@@ -472,6 +532,12 @@ pub(crate) fn transform_dimension(e: &mut Dimension, transform: &Transform) {
         d.base.insertion_point = new_wcs_to_ocs * transform.apply(old_ocs * d.base.insertion_point);
         d.base.normal = new_normal;
 
+        // The horizontal direction is fixed in the plane: a rotate or mirror
+        // in it keeps measuring along the same axis.
+        if same_plane(old_normal, new_normal) {
+            d.refresh_measurement();
+            return;
+        }
         let transformed_axis = new_wcs_to_ocs * transform.apply_rotation(old_axis);
         let mut new_axis_angle = old_axis_angle;
         if transformed_axis.length_squared() > 1e-24 {
@@ -491,8 +557,10 @@ pub(crate) fn transform_dimension(e: &mut Dimension, transform: &Transform) {
     let new_normal = transform_normal(transform, old_normal);
     // A mirror moves a dimension but never mirrors its text: the text keeps
     // the direction it reads in (0 still meaning along the dimension line),
-    // as mirrored text does with MIRRTEXT off.
-    let keep_text = is_reflecting(transform);
+    // as mirrored text does with MIRRTEXT off. The horizontal direction and
+    // the text rotation measured from it are fixed in the plane, so a rotate
+    // in it keeps them too.
+    let keep_text = is_reflecting(transform) || same_plane(old_normal, new_normal);
     // A text rotation of 0 is "along the dimension line", not an angle: the
     // text turns with the line, so it stays 0.
     let text_rotation = if keep_text || e.base().text_rotation == 0.0 {
@@ -556,8 +624,14 @@ pub(crate) fn transform_dimension(e: &mut Dimension, transform: &Transform) {
                 d.ext_line_rotation = ext_line_rotation;
             }
         }
-        Dimension::Radius(d) => d.angle_vertex = transform.apply(d.angle_vertex),
-        Dimension::Diameter(d) => d.angle_vertex = transform.apply(d.angle_vertex),
+        Dimension::Radius(d) => {
+            d.angle_vertex = transform.apply(d.angle_vertex);
+            d.leader_length *= transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0)).length();
+        }
+        Dimension::Diameter(d) => {
+            d.angle_vertex = transform.apply(d.angle_vertex);
+            d.leader_length *= transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0)).length();
+        }
         Dimension::Angular2Ln(d) => {
             d.dimension_arc = transform.apply(d.dimension_arc);
             d.first_point = transform.apply(d.first_point);
@@ -942,14 +1016,16 @@ pub(crate) fn transform_insert(e: &mut Insert, transform: &Transform) {
     // uniform parent scale grows with its geometry (ACAD doubles a 10-unit
     // spacing under a 2x parent).  A scalar spacing cannot encode shear, so
     // retain the transformed vector length, which is the closest representable
-    // INSERT spacing and is exact for similarity transforms.
+    // INSERT spacing and is exact for similarity transforms.  The sign comes
+    // from the new local axes, as for the scale factors above: a negative
+    // spacing (an array running along -X or -Y) keeps running that way.
     if e.column_spacing != 0.0 {
         let v = transformation * (trans_ow * Vector3::new(e.column_spacing, 0.0, 0.0));
-        e.column_spacing = v.length();
+        e.column_spacing = v.length().copysign((trans_wo_rot * v).x);
     }
     if e.row_spacing != 0.0 {
         let v = transformation * (trans_ow * Vector3::new(0.0, e.row_spacing, 0.0));
-        e.row_spacing = v.length();
+        e.row_spacing = v.length().copysign((trans_wo_rot * v).y);
     }
 
     let clamp = |val: f64| -> f64 {
@@ -1038,6 +1114,10 @@ pub(crate) fn transform_attribute_definition(e: &mut AttributeDefinition, transf
     let scale_factor = transformed_unit.length();
     e.height *= scale_factor;
     rotate_ocs_angle(&mut e.rotation, old_normal, transform);
+    // A multiline attribute draws its embedded MTEXT: transform it too.
+    if let Some(m) = e.embedded_mtext.as_deref_mut() {
+        transform_mtext(m, transform);
+    }
 }
 
 // ── AttributeEntity ──────────────────────────────────────────────────────────
@@ -1057,6 +1137,9 @@ pub(crate) fn transform_attribute_entity(e: &mut AttributeEntity, transform: &Tr
     let scale_factor = transformed_unit.length();
     e.height *= scale_factor;
     rotate_ocs_angle(&mut e.rotation, old_normal, transform);
+    if let Some(m) = e.embedded_mtext.as_deref_mut() {
+        transform_mtext(m, transform);
+    }
 }
 
 // ── Leader ───────────────────────────────────────────────────────────────────
@@ -1066,8 +1149,12 @@ pub(crate) fn transform_leader(e: &mut Leader, transform: &Transform) {
     for vertex in &mut e.vertices {
         *vertex = transform.apply(*vertex);
     }
-    e.block_offset = transform.apply(e.block_offset);
-    e.annotation_offset = transform.apply(e.annotation_offset);
+    // Offsets from the last vertex: they turn and scale, never move.
+    e.block_offset = transform.apply_rotation(e.block_offset);
+    e.annotation_offset = transform.apply_rotation(e.annotation_offset);
+    let scale_factor = transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0)).length();
+    e.text_height *= scale_factor;
+    e.text_width *= scale_factor;
     e.horizontal_direction = transform.apply_rotation(e.horizontal_direction).normalize();
     e.normal = transform.apply_rotation(e.normal).normalize();
 }
@@ -1121,7 +1208,11 @@ pub(crate) fn transform_multileader(e: &mut MultiLeader, transform: &Transform) 
     e.dogleg_length *= scale_factor;
     e.context.arrowhead_size *= scale_factor;
     e.context.text_height *= scale_factor;
+    scale_inline_heights(&mut e.context.text_string, scale_factor);
     e.context.landing_gap *= scale_factor;
+    e.context.text_width *= scale_factor;
+    e.context.text_boundary_height *= scale_factor;
+    e.context.block_content_scale = e.context.block_content_scale * scale_factor;
     rotate_stored_angle(&mut e.context.text_rotation, transform);
     rotate_stored_angle(&mut e.context.block_rotation, transform);
     rotate_stored_angle(&mut e.block_rotation, transform);
@@ -1164,6 +1255,7 @@ pub(crate) fn transform_raster_image(e: &mut RasterImage, transform: &Transform)
 
 pub(crate) fn transform_solid3d(e: &mut Solid3D, transform: &Transform) {
     e.common.raw_record = None;
+    e.resolve_deferred_reference_point();
     e.point_of_reference = transform.apply(e.point_of_reference);
     compose_acis_placement(&mut e.acis_data, transform);
     for wire in &mut e.wires {
@@ -1189,6 +1281,7 @@ pub(crate) fn transform_solid3d(e: &mut Solid3D, transform: &Transform) {
 
 pub(crate) fn transform_region(e: &mut Region, transform: &Transform) {
     e.common.raw_record = None;
+    e.resolve_deferred_reference_point();
     e.point_of_reference = transform.apply(e.point_of_reference);
     compose_acis_placement(&mut e.acis_data, transform);
     for wire in &mut e.wires {
@@ -1214,6 +1307,7 @@ pub(crate) fn transform_region(e: &mut Region, transform: &Transform) {
 
 pub(crate) fn transform_body(e: &mut Body, transform: &Transform) {
     e.common.raw_record = None;
+    e.resolve_deferred_reference_point();
     e.point_of_reference = transform.apply(e.point_of_reference);
     compose_acis_placement(&mut e.acis_data, transform);
     for wire in &mut e.wires {
@@ -1472,6 +1566,10 @@ impl EntityType {
             EntityType::Extended(e) => e.apply_transform(transform),
             EntityType::Unknown(e) => transform_unknown(e, transform),
         }
+        // Unknown records have no geometry for their XDATA to follow.
+        if !matches!(self, EntityType::Unknown(_)) {
+            let _ = self.common_mut().extended_data.apply_transform(transform);
+        }
         // Applying a semantic transform invalidates verbatim DWG provenance;
         // unknown entities have no editable geometry and keep their payload.
         if transform_invalidates_raw_record(self) {
@@ -1512,6 +1610,21 @@ mod tests {
         transform_line(&mut line, &t);
         assert!((line.start.x - 2.0).abs() < 1e-10);
         assert!((line.end.x - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_transform_multiline_attribute_transforms_embedded_mtext() {
+        let mut att = AttributeEntity::new("T".into(), "V".into());
+        let mut m = MText::new();
+        m.insertion_point = Vector3::new(10.0, 0.0, 0.0);
+        m.height = 2.5;
+        att.embedded_mtext = Some(Box::new(m));
+
+        // SCALE 2 about the origin: the drawn MTEXT must scale with the attribute.
+        transform_attribute_entity(&mut att, &Transform::from_scale(2.0));
+        let m = att.embedded_mtext.as_ref().unwrap();
+        assert!((m.insertion_point.x - 20.0).abs() < 1e-10);
+        assert!((m.height - 5.0).abs() < 1e-10);
     }
 
     #[test]
@@ -1793,5 +1906,115 @@ mod tests {
         );
         assert!((b.vertices[0].bulge - 0.5).abs() < 1e-12);
         assert!((b.vertices[1].bulge - (-0.3)).abs() < 1e-12);
+    }
+
+    // SCALE in AutoCAD scales polyline widths with the geometry: constant
+    // width (43), vertex start/end widths (40/41) and the 2D polyline's
+    // default widths. Rotation and reflection keep them.
+    #[test]
+    fn test_transform_scales_polyline_widths() {
+        let mut lw = LwPolyline::new();
+        lw.constant_width = 1.0;
+        let mut v0 = LwVertex::new(crate::types::Vector2::new(0.0, 0.0));
+        v0.start_width = 0.5;
+        v0.end_width = 2.0;
+        lw.add_vertex(v0);
+        lw.add_vertex(LwVertex::new(crate::types::Vector2::new(10.0, 0.0)));
+
+        let mut pl = Polyline2D::new();
+        pl.start_width = 1.0;
+        pl.end_width = 1.5;
+        let mut w0 = Vertex2D::new(Vector3::new(0.0, 0.0, 0.0));
+        w0.start_width = 0.5;
+        w0.end_width = 3.0;
+        pl.add_vertex(w0);
+        pl.add_vertex(Vertex2D::new(Vector3::new(10.0, 0.0, 0.0)));
+
+        let widths = |lw: &LwPolyline, pl: &Polyline2D| {
+            [
+                lw.constant_width,
+                lw.vertices[0].start_width,
+                lw.vertices[0].end_width,
+                pl.start_width,
+                pl.end_width,
+                pl.vertices[0].start_width,
+                pl.vertices[0].end_width,
+            ]
+        };
+        let original = widths(&lw, &pl);
+        let cases = [
+            (Transform::from_scale(2.0), 2.0),
+            (
+                Transform::from_rotation(Vector3::new(0.0, 0.0, 1.0), 1.0),
+                1.0,
+            ),
+            (Transform::from_scaling(Vector3::new(-1.0, 1.0, 1.0)), 1.0),
+        ];
+        for (t, factor) in cases {
+            let (mut a, mut b) = (lw.clone(), pl.clone());
+            transform_lwpolyline(&mut a, &t);
+            transform_polyline2d(&mut b, &t);
+            for (got, was) in widths(&a, &b).iter().zip(original) {
+                assert!(
+                    (got - was * factor).abs() < 1e-12,
+                    "{got} != {was} * {factor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_transform_multileader_scales_text_width_and_block() {
+        let mut ml = MultiLeader::default();
+        ml.context.text_width = 20.0;
+        ml.context.text_boundary_height = 5.0;
+        let t = Transform::from_scale(2.0);
+        transform_multileader(&mut ml, &t);
+        assert!((ml.context.text_width - 40.0).abs() < 1e-10);
+        assert!((ml.context.text_boundary_height - 10.0).abs() < 1e-10);
+        assert_eq!(ml.context.block_content_scale, Vector3::new(2.0, 2.0, 2.0));
+        // AutoCAD keeps the entity-level block scale override.
+        assert_eq!(ml.block_scale, Vector3::new(1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn test_transform_mtext_keeps_a_unit_direction() {
+        let mut m = MText::new();
+        m.insertion_point = Vector3::new(0.0, 20.0, 0.0);
+        m.height = 2.5;
+        m.dwg_x_direction = Some(Vector3::UNIT_X);
+
+        // SCALE 2 about the origin: height doubles, the direction stays (1, 0, 0).
+        transform_mtext(&mut m, &Transform::from_scale(2.0));
+        assert!((m.height - 5.0).abs() < 1e-10);
+        assert_vector_near(m.dwg_x_direction.unwrap(), Vector3::UNIT_X);
+
+        transform_mtext(
+            &mut m,
+            &Transform::from_rotation(Vector3::UNIT_Z, std::f64::consts::FRAC_PI_2)
+                .then(&Transform::from_scale(3.0)),
+        );
+        assert_vector_near(m.dwg_x_direction.unwrap(), Vector3::UNIT_Y);
+    }
+
+    #[test]
+    fn test_transform_minsert_keeps_negative_spacing_direction() {
+        // Two columns 2 apart and two rows 3 apart, both running along -X / -Y.
+        let source = Insert::new("B", Vector3::new(1.0, 1.0, 0.0)).with_array(2, 2, -2.0, -3.0);
+        let transforms = [
+            Transform::from_rotation(Vector3::UNIT_Z, std::f64::consts::FRAC_PI_2),
+            Transform::from_scale(2.0),
+            Transform::from_scaling(Vector3::new(-1.0, 1.0, 1.0)),
+        ];
+        for t in &transforms {
+            let mut minsert = source.clone();
+            transform_insert(&mut minsert, t);
+            // Every array instance lands where the transform sends it.
+            let expected: Vec<Vector3> =
+                source.array_points().iter().map(|p| t.apply(*p)).collect();
+            for (actual, expected) in minsert.array_points().iter().zip(&expected) {
+                assert_vector_near(*actual, *expected);
+            }
+        }
     }
 }

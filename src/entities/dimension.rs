@@ -101,6 +101,15 @@ pub struct DimensionBase {
     /// follows the dimension style (DIMTAD etc.); when true `text_middle_point`
     /// is an explicit override.
     pub text_user_positioned: bool,
+    /// Yalnızca ÇİZİM için: bu ölçü ölçekli bir INSERT'in (blok) içinden
+    /// açıldıysa, o INSERT'in birikmiş düzlem ölçeği (1.0 = ölçeksiz).
+    ///
+    /// Ölçü geometrisi (tanım noktaları) INSERT ölçeğiyle küçülür/büyür ama ok,
+    /// yazı ve uzantı boyutları DIMSTYLE'dan gelir; AutoCAD'de ise bunlar da
+    /// anonim `*D` bloğunun parçası olarak birlikte ölçeklenir. `dim_render`
+    /// bu değeri stil boyutlarına uygular. Dosyaya YAZILMAZ ve düzenleme
+    /// (taşı/ölçekle) komutlarını etkilemez; sadece `Insert::explode*` ayarlar.
+    pub render_scale: f64,
 }
 
 impl DimensionBase {
@@ -132,6 +141,7 @@ impl DimensionBase {
             // Bit 0 set: the text sits at its default place.
             dwg_flags_byte: 0x01,
             text_user_positioned: false,
+            render_scale: 1.0,
         }
     }
 

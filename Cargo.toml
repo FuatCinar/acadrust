@@ -2,19 +2,23 @@
 name = "acadrust"
 version = "0.6.8"
 edition = "2021"
-authors = ["Hakan AK"]
+authors = ["Hakan AK", "Fuat Deneme"]
 description = "A pure Rust library for reading and writing CAD files in DXF format (ASCII and Binary) and DWG format (Binary)."
 license = "MPL-2.0"
-repository = "https://github.com/hakanaktt/acadrust"
-homepage = "https://github.com/hakanaktt/acadrust"
+repository = "https://github.com/FuatCinar/acadrust"
+homepage = "https://github.com/FuatCinar/acadrust"
 documentation = "https://docs.rs/acadrust"
 readme = "README.md"
 keywords = ["cad", "dxf", "dwg", "drawing", "vector-graphics"]
 categories = ["parser-implementations", "encoding"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [features]
 default = ["parallel"]
 parallel = ["dep:rayon"]
+android = ["dep:jni"]
 serde = ["dep:serde", "bitflags/serde", "indexmap/serde"]
 import = ["dep:quick-xml", "dep:serde_json"]
 
@@ -22,9 +26,10 @@ import = ["dep:quick-xml", "dep:serde_json"]
 # Error handling
 thiserror = "2"
 anyhow = "1.0"
-
+jni = { version = "0.21", optional = true }
 # Binary parsing
 nom = "7.1"
+memchr = "2"
 byteorder = "1.5"
 
 # Compression
@@ -33,6 +38,7 @@ flate2 = "1.0"
 # Collections
 indexmap = "2.0"
 foldhash = "0.2"
+ahash = { version = "0.8", features = ["serde"] }
 
 # Encoding
 encoding_rs = "0.8"
@@ -69,6 +75,7 @@ serde_json = "1"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true
 
 [profile.bench]
 inherits = "release"

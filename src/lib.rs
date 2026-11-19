@@ -195,6 +195,7 @@
 //! | [`entities::acis`] | ACIS/SAT/SAB parsing, writing, and primitive builders |
 //! | [`notification`] | Structured parse notifications and recovery counts |
 //! | [`classes::arch`] | ACAD Arch entities, objects, constructors, and edits |
+//! | [`classes::civil`] | Civil 3D class catalog and TIN surface geometry |
 //!
 //! ## File Version Support
 //!
@@ -257,8 +258,10 @@ pub use types::{
 
 // Re-export entity types
 pub use entities::{
-    Arc, Circle, Ellipse, EmbeddedEntity, Entity, EntityType, Line, LwPolyline, MText, Point,
-    Polyline, ProxyGraphicRecord, ProxyGraphics, ProxyUnicodeText, Spline, Text,
+    Arc, CheckedProxyGraphicRecord, CheckedProxyGraphics, Circle, Ellipse, EmbeddedEntity, Entity,
+    EntityType, Line, LwPolyline, MText, Point, Polyline, ProxyGraphicCommand, ProxyGraphicError,
+    ProxyGraphicErrorReason, ProxyGraphicRecord, ProxyGraphics, ProxyLegacyText,
+    ProxyLegacyTextStyle, ProxyStyledUnicodeText, ProxyUnicodeText, Spline, Text,
 };
 
 // Re-export table types
@@ -269,15 +272,15 @@ pub use tables::{
 
 // Re-export document
 pub use document::{
-    BlockGraph, CadDocument, Preview, PreviewFormat, SemanticEntityV1, SemanticInventoryV1,
-    SemanticNodeV1, SemanticObjectV1, SemanticPartV1, SemanticReferenceV1,
-    SemanticRelationshipKindV1, SemanticTableRecordV1, SolidHistoryGraph,
-    SEMANTIC_INVENTORY_VERSION,
+    BlockGraph, CadDocument, HandleReservation, HandleReservationError, HandleReservationIter,
+    Preview, PreviewFormat, SemanticEntityV1, SemanticInventoryV1, SemanticNodeV1,
+    SemanticObjectV1, SemanticPartV1, SemanticReferenceV1, SemanticRelationshipKindV1,
+    SemanticTableRecordV1, SolidHistoryGraph, SEMANTIC_INVENTORY_VERSION,
 };
 pub use layer_state::{LayerState, LayerStateLayer, LayerStateMask};
 
 // Re-export I/O types
-pub use io::dwg::{DwgReadOptions, DwgReader, DwgWriter, MeshFaceBudget};
+pub use io::dwg::{DwgReadOptions, DwgReader, DwgWriteDiagnostic, DwgWriter, MeshFaceBudget};
 pub use io::dxf::{DxfOmission, DxfReader, DxfReaderConfiguration, DxfWriter};
 pub use io::read::{
     push_read_diagnostic, ReadDiagnostic, ReadOutcome, ReadStage, ReadStats, SourceFormat,
@@ -324,3 +327,29 @@ mod tests {
 mod drawing_variables;
 
 mod hatch_origin;
+
+// --- DWGCad (kendi kodum) - acadrust'tan ayri dosyalar ---
+#[cfg(feature = "android")]
+mod android_jni;
+#[cfg(feature = "android")]
+mod block_insert;
+#[cfg(feature = "android")]
+mod hatch_patterns;
+#[allow(dead_code)]
+#[cfg(feature = "android")]
+mod cad_fill;
+#[allow(dead_code)]
+#[cfg(feature = "android")]
+mod ncz_linetype;
+#[allow(dead_code)]
+#[cfg(feature = "android")]
+mod gradient_fill;
+#[allow(dead_code)]
+#[cfg(feature = "android")]
+mod dim_render;
+#[allow(dead_code)]
+#[cfg(feature = "android")]
+mod tolerance_render;
+#[allow(dead_code)]
+#[cfg(feature = "android")]
+mod raster_export;

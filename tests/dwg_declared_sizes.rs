@@ -4,11 +4,14 @@
 
 use std::io::Cursor;
 
+use acadrust::entities::solid3d::{AcisVersion, Solid3D};
 use acadrust::entities::{EntityType, Line};
 use acadrust::io::dwg::compression::DwgLZ77AC18Compressor;
 use acadrust::io::dwg::decompressor_ac18::decompress_ac18;
 use acadrust::io::dwg::decompressor_ac21::decompress_ac21;
 use acadrust::io::dwg::dwg21_metadata::Dwg21CompressedMetadata;
+use acadrust::notification::NotificationType;
+use acadrust::types::Handle;
 use acadrust::{CadDocument, DwgReadOptions, DwgReader, DwgWriter, DxfVersion};
 
 /// Section types of the AC18 page map and section map (system pages, headers not masked).
@@ -20,6 +23,8 @@ const SECTION_MAP: u32 = 0x4163_003B;
 const AC21_HEADER: usize = 0x80;
 const RS_BLOCKS: usize = 3;
 const RS_DATA: usize = 239;
+/// The section that holds the SAB data of R2013+ modeler entities.
+const ACDS: &str = "AcDb:AcDsPrototype_1b";
 
 fn dwg(version: DxfVersion) -> Vec<u8> {
     let mut document = CadDocument::with_version(version);
@@ -110,10 +115,21 @@ fn system_page(bytes: &[u8], kind: u32) -> usize {
 /// part followed by 16 bytes per page) through `edit`, and writes the recompressed map back
 /// in place of the old one.
 fn rewrite_section_map(bytes: &[u8], edit: impl Fn(&str, Vec<u8>) -> Vec<u8>) -> Vec<u8> {
+    try_rewrite_section_map(bytes, edit).expect("rewritten section map does not fit")
+}
+
+/// `rewrite_section_map`, or `None` when the recompressed map is larger than the old one.
+fn try_rewrite_section_map(
+    bytes: &[u8],
+    edit: impl Fn(&str, Vec<u8>) -> Vec<u8>,
+) -> Option<Vec<u8>> {
     let at = system_page(bytes, SECTION_MAP);
     let size = i32_at(bytes, at + 4) as usize;
-    let room = i32_at(bytes, at + 8) as usize;
-    let map = decompress_ac18(&bytes[at + 20..at + 20 + room], size);
+    let compressed = i32_at(bytes, at + 8) as usize;
+    let map = decompress_ac18(&bytes[at + 20..at + 20 + compressed], size);
+    // The page is padded to a 0x20 boundary after its 20-byte header and data: the rewritten
+    // map may use that padding too.
+    let room = ((20 + compressed + 0x1F) & !0x1F) - 20;
     let mut out = map[..20].to_vec();
     let mut pos = 20;
     for _ in 0..i32_at(&map, 0) {
@@ -127,12 +143,14 @@ fn rewrite_section_map(bytes: &[u8], edit: impl Fn(&str, Vec<u8>) -> Vec<u8>) ->
     }
     out.extend_from_slice(&map[pos..]);
     let packed = DwgLZ77AC18Compressor::new().compress(&out, 0, out.len());
-    assert!(packed.len() <= room, "rewritten section map does not fit");
+    if packed.len() > room {
+        return None;
+    }
     let mut bytes = bytes.to_vec();
     put_i32(&mut bytes, at + 4, out.len() as i32);
     put_i32(&mut bytes, at + 8, packed.len() as i32);
     bytes[at + 20..at + 20 + packed.len()].copy_from_slice(&packed);
-    bytes
+    Some(bytes)
 }
 
 /// Makes `section` claim `data_size` bytes with a page count of -1, so that no page
@@ -150,9 +168,10 @@ fn inflate_section(bytes: &[u8], section: &str, data_size: u64) -> Vec<u8> {
 }
 
 /// Makes a section declare a small amount of padding beyond the sum of its parsed page
-/// capacities. AC1032 files in the wild use this form for the objects section.
-fn overshoot_section(bytes: &[u8], section: &str, extra: u64) -> Vec<u8> {
-    rewrite_section_map(bytes, |name, descriptor| {
+/// capacities. AC1032 files in the wild use this form for the objects section. `None` when
+/// the edited map no longer compresses into the old map's room.
+fn overshoot_section(bytes: &[u8], section: &str, extra: u64) -> Option<Vec<u8>> {
+    try_rewrite_section_map(bytes, |name, descriptor| {
         if name != section {
             return descriptor;
         }
@@ -163,6 +182,56 @@ fn overshoot_section(bytes: &[u8], section: &str, extra: u64) -> Vec<u8> {
         descriptor[..8].copy_from_slice(&capacity.saturating_add(extra).to_le_bytes());
         descriptor
     })
+}
+
+/// An AC1032 drawing with one 3DSOLID whose SAB blob holds `zeros` zero bytes between the
+/// SAB magic and terminator, so that its AcDs section has pages of zeros in the middle.
+fn dwg_with_solid(zeros: usize) -> (Vec<u8>, Handle, Vec<u8>) {
+    let mut sab = b"ASM BinaryFile".to_vec();
+    sab.resize(sab.len() + zeros, 0);
+    sab.extend_from_slice(b"\x0E\x03End\x0E\x02of\x0E\x03ASM\x0D\x04data");
+    let mut solid = Solid3D::new();
+    solid.acis_data.sab_data = sab.clone();
+    solid.acis_data.is_binary = true;
+    solid.acis_data.version = AcisVersion::Version2;
+    let mut document = CadDocument::with_version(DxfVersion::AC1032);
+    let handle = document.add_entity(EntityType::Solid3D(solid)).unwrap();
+    (DwgWriter::write_to_vec(&document).unwrap(), handle, sab)
+}
+
+fn sab_of(document: &CadDocument, handle: Handle) -> &[u8] {
+    match document.get_entity(handle) {
+        Some(EntityType::Solid3D(solid)) => &solid.acis_data.sab_data,
+        other => panic!("3DSOLID {handle:?} missing: {other:?}"),
+    }
+}
+
+/// Drops the page descriptors of `section` whose pages hold only zeros, as AutoCAD saves
+/// such sections: the declared size and the other pages' offsets stay, and the reader is to
+/// zero-fill the gaps. Returns the edited file and the number of descriptors kept.
+fn drop_zero_pages(bytes: &[u8], section: &str) -> (Vec<u8>, usize) {
+    let mut reader = DwgReader::from_stream(Cursor::new(bytes.to_vec()));
+    let info = reader.read_file_header().unwrap();
+    let data = reader.get_section_buffer(section, &info).unwrap();
+    let kept = std::cell::Cell::new(0);
+    let bytes = rewrite_section_map(bytes, |name, descriptor| {
+        if name != section {
+            return descriptor;
+        }
+        let page_size = i32_at(&descriptor, 12) as usize;
+        let mut out = descriptor[..96].to_vec();
+        for entry in descriptor[96..].chunks(16) {
+            let start = u64::from_le_bytes(entry[8..16].try_into().unwrap()) as usize;
+            let end = (start + page_size).min(data.len());
+            if data[start..end].iter().any(|&b| b != 0) {
+                out.extend_from_slice(entry);
+            }
+        }
+        kept.set((out.len() - 96) / 16);
+        put_i32(&mut out, 8, kept.get() as i32);
+        out
+    });
+    (bytes, kept.get())
 }
 
 fn rs_index(i: usize) -> usize {
@@ -240,7 +309,11 @@ fn ac18_section_size_is_bounded_by_its_parsed_pages() {
 #[test]
 fn ac18_small_section_capacity_overshoot_keeps_objects_readable() {
     let bytes = dwg(DxfVersion::AC1032);
-    let padded = overshoot_section(&bytes, "AcDb:AcDbObjects", 1);
+    // Any overshoot under a page will do: the first whose edited section map still
+    // compresses into the old map's room.
+    let padded = (1..=255)
+        .find_map(|extra| overshoot_section(&bytes, "AcDb:AcDbObjects", extra))
+        .expect("an overshoot whose section map fits");
     assert_eq!(entity_count(&padded), 3);
 }
 
@@ -274,4 +347,82 @@ fn ac21_map_sizes_are_checked_before_allocation() {
             );
         }
     }
+}
+
+#[test]
+fn ac21_header_min_compr_len_does_not_overflow() {
+    let bytes = dwg(DxfVersion::AC1021);
+    let mut decoded: Vec<u8> = (0..RS_BLOCKS * RS_DATA)
+        .map(|i| bytes[rs_index(i)])
+        .collect();
+    put_i32(&mut decoded, 0x18, i32::MIN);
+    let mut bad_bytes = bytes.clone();
+    for (i, byte) in decoded.into_iter().enumerate() {
+        bad_bytes[rs_index(i)] = byte;
+    }
+    let _ = DwgReader::from_stream(Cursor::new(bad_bytes)).read();
+}
+
+#[test]
+fn ac18_sparse_section_is_bounded_by_its_furthest_page() {
+    // About 7 pages of 0x7400 bytes, 5 of them all zeros.
+    let (bytes, handle, sab) = dwg_with_solid(6 * 0x7400);
+    let document = DwgReader::from_stream(Cursor::new(bytes.clone()))
+        .read()
+        .unwrap();
+    assert_eq!(sab_of(&document, handle), sab.as_slice());
+
+    let mut reader = DwgReader::from_stream(Cursor::new(bytes.clone()));
+    let info = reader.read_file_header().unwrap();
+    let dense = reader.get_section_buffer(ACDS, &info).unwrap();
+    let section = DwgReader::<Cursor<Vec<u8>>>::find_section(&info, ACDS).unwrap();
+    let pages = section.pages.len();
+
+    let (sparse, kept) = drop_zero_pages(&bytes, ACDS);
+    // The declared size is more than twice what the kept descriptors hold one after another.
+    assert!(
+        dense.len() > 2 * kept * 0x7400,
+        "{kept} of {pages} pages kept for {} bytes",
+        dense.len()
+    );
+    let mut reader = DwgReader::from_stream(Cursor::new(sparse.clone()));
+    let info = reader.read_file_header().unwrap();
+    let read = reader.get_section_buffer(ACDS, &info).unwrap();
+    assert!(read == dense, "the gaps must read as zeros");
+
+    let document = DwgReader::from_stream(Cursor::new(sparse)).read().unwrap();
+    assert_eq!(sab_of(&document, handle), sab.as_slice());
+}
+
+#[test]
+fn unreadable_acds_section_is_reported() {
+    let (bytes, handle, _) = dwg_with_solid(16);
+    let bad = inflate_section(&bytes, ACDS, 512 << 20);
+    for options in [DwgReadOptions::default(), DwgReadOptions::failsafe()] {
+        let failsafe = options.failsafe;
+        let document = DwgReader::from_stream_with_options(Cursor::new(bad.clone()), options)
+            .read()
+            .unwrap();
+        assert!(sab_of(&document, handle).is_empty());
+        let warned = document
+            .notifications
+            .of_type(NotificationType::Warning)
+            .iter()
+            .any(|n| n.message.contains(ACDS) && n.message.contains("0 page(s)"));
+        assert!(
+            warned,
+            "failsafe={failsafe}: no warning for the unread {ACDS} section"
+        );
+    }
+}
+
+#[test]
+fn drawing_without_acds_section_raises_no_acds_warning() {
+    let document = DwgReader::from_stream(Cursor::new(dwg(DxfVersion::AC1032)))
+        .read()
+        .unwrap();
+    assert!(!document
+        .notifications
+        .iter()
+        .any(|n| n.message.contains(ACDS)));
 }

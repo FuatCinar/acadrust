@@ -56,6 +56,8 @@ pub struct ReadDiagnostic {
     pub source_offset_basis: Option<String>,
     pub source_line: Option<usize>,
     pub record_handle: Option<u64>,
+    /// The record's type name: the DXF record name, or for a DWG record the
+    /// DXF name of its fixed type or class (`DWG_OBJ_<code>` when unnamed).
     pub record_type: Option<String>,
     pub message: String,
 }
@@ -183,6 +185,7 @@ pub struct ReadOutcome {
 impl ReadOutcome {
     pub fn new(mut document: CadDocument, stats: ReadStats) -> Self {
         super::loft_parameters::restore(&mut document);
+        document.apply_sort_tables(); // SORTENTS: dosyadaki çizim sırası
         Self { document, stats }
     }
 }

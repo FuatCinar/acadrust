@@ -58,7 +58,8 @@ fn read_back(bytes: Vec<u8>) -> (f64, f64, bool) {
 #[test]
 fn issue_159_a_clockwise_arc_edge_is_stored_with_complementary_angles() {
     // Clockwise from 90 to 270 degrees: the right half of the circle.
-    let bytes = DxfWriter::new(&doc_with(FRAC_PI_2, 3.0 * FRAC_PI_2, false))
+    // Stored angles in the model are 270° and 90°.
+    let bytes = DxfWriter::new(&doc_with(3.0 * FRAC_PI_2, FRAC_PI_2, false))
         .write_to_vec()
         .unwrap();
     let (s, e) = stored_angles(&bytes);
@@ -67,11 +68,11 @@ fn issue_159_a_clockwise_arc_edge_is_stored_with_complementary_angles() {
 
 #[test]
 fn issue_159_a_clockwise_arc_edge_reads_back_as_it_was_written() {
-    let bytes = DxfWriter::new(&doc_with(FRAC_PI_2, 3.0 * FRAC_PI_2, false))
+    let bytes = DxfWriter::new(&doc_with(3.0 * FRAC_PI_2, FRAC_PI_2, false))
         .write_to_vec()
         .unwrap();
     let (s, e, ccw) = read_back(bytes);
-    assert!((s - FRAC_PI_2).abs() < 1e-9 && (e - 3.0 * FRAC_PI_2).abs() < 1e-9, "{s} {e}");
+    assert!((s - 3.0 * FRAC_PI_2).abs() < 1e-9 && (e - FRAC_PI_2).abs() < 1e-9, "{s} {e}");
     assert!(!ccw);
 }
 
@@ -87,7 +88,7 @@ fn issue_159_a_dxf_that_autocad_would_write_reads_as_the_same_arc() {
     let edited = format!("{}\n 73\n     0\n{}", &text[..flag], &text[flag + "\n 73\n     1\n".len()..]);
     let (s, e, ccw) = read_back(edited.into_bytes());
     assert!(!ccw, "the flag is 0");
-    assert!((s - FRAC_PI_2).abs() < 1e-9 && (e - 1.5 * PI).abs() < 1e-9, "read {s} {e}");
+    assert!((s - 1.5 * PI).abs() < 1e-9 && (e - FRAC_PI_2).abs() < 1e-9, "read {s} {e}");
 }
 
 #[test]

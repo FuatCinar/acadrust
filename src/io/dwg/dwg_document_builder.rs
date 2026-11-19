@@ -32,12 +32,204 @@ fn viewport_override_base_layer(name: &str) -> Option<&str> {
         .then_some(base)
 }
 use crate::io::dwg::dwg_stream_readers::object_reader::{DwgObjectReader, EntityCommonData};
+
+/// Report relationships the file itself leaves inconsistent, which the reader
+/// keeps as stored rather than repairing (acadrust #135-#142): block markers
+/// without a record or disagreeing with it, layer references that resolve to
+/// nothing or to another name, nonfinite polyline bulges, unnamed text styles
+/// and shape segments without a style. A consumer that requires a consistent
+/// drawing reads the reason here instead of inferring it from a clean read.
+fn source_state_diagnostics(document: &CadDocument, diagnostics: &mut Vec<ReadDiagnostic>) {
+    let mut report = |code: &str, handle: Handle, kind: &str, message: String| {
+        let mut diagnostic = ReadDiagnostic::new(code, ReadStage::Objects, message);
+        diagnostic.record_handle = Some(handle.value());
+        diagnostic.record_type = Some(kind.to_string());
+        push_read_diagnostic(diagnostics, diagnostic);
+    };
+    let mut marker_names: HashMap<Handle, &str> = HashMap::new();
+    for record in document.block_records.iter() {
+        for marker in [record.block_entity_handle, record.block_end_handle] {
+            if marker.is_null() {
+                continue;
+            }
+            if let Some(other) = marker_names.insert(marker, &record.name) {
+                report(
+                    "shared-block-marker",
+                    marker,
+                    "BLOCK_RECORD",
+                    format!(
+                        "Block records {other:?} and {:?} both name marker {:#X}",
+                        record.name,
+                        marker.value()
+                    ),
+                );
+            }
+        }
+    }
+    for entity in &document.entities {
+        let common = entity.common();
+        let handle = common.handle;
+        let (kind, is_end) = match entity.as_ref() {
+            EntityType::Block(_) => ("BLOCK", false),
+            EntityType::BlockEnd(_) => ("ENDBLK", true),
+            _ => continue,
+        };
+        let record = document
+            .block_records
+            .iter()
+            .find(|record| record.handle == common.owner_handle);
+        match record {
+            None => report(
+                "orphan-block-marker",
+                handle,
+                kind,
+                format!(
+                    "{kind} {:#X} is owned by {:#X}, which is not a block record",
+                    handle.value(),
+                    common.owner_handle.value()
+                ),
+            ),
+            Some(record) => {
+                let named = match is_end {
+                    true => record.block_end_handle,
+                    false => record.block_entity_handle,
+                };
+                if named != handle {
+                    report(
+                        "block-marker-mismatch",
+                        handle,
+                        kind,
+                        format!(
+                            "Block record {:?} names {kind} {:#X}, but the {kind} it owns is {:#X}",
+                            record.name,
+                            named.value(),
+                            handle.value()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    for entity in document.entities() {
+        let common = entity.common();
+        let kind = entity.as_entity().entity_type();
+        if let Some(layer_handle) = common.layer_handle.filter(|handle| !handle.is_null()) {
+            match document.layers.iter().find(|layer| layer.handle == layer_handle) {
+                None => report(
+                    "unresolved-layer-handle",
+                    common.handle,
+                    kind,
+                    format!(
+                        "{kind} {:#X} references layer {:#X}, which is not in the layer table; it reads as layer {:?}",
+                        common.handle.value(),
+                        layer_handle.value(),
+                        common.layer
+                    ),
+                ),
+                // A hidden per-viewport override record reads as its base layer.
+                Some(layer)
+                    if !layer.name.eq_ignore_ascii_case(&common.layer)
+                        && !viewport_override_base_layer(&layer.name)
+                            .is_some_and(|base| base.eq_ignore_ascii_case(&common.layer)) =>
+                {
+                    report(
+                        "layer-name-handle-mismatch",
+                        common.handle,
+                        kind,
+                        format!(
+                            "{kind} {:#X} names layer {:?} but references {:?} ({:#X})",
+                            common.handle.value(),
+                            common.layer,
+                            layer.name,
+                            layer_handle.value()
+                        ),
+                    )
+                }
+                Some(_) => {}
+            }
+        }
+        if let EntityType::LwPolyline(polyline) = entity {
+            if let Some(index) = polyline.vertices.iter().position(|v| !v.bulge.is_finite()) {
+                report(
+                    "nonfinite-bulge",
+                    common.handle,
+                    kind,
+                    format!(
+                        "LWPOLYLINE {:#X} stores a nonfinite bulge at vertex {index}",
+                        common.handle.value()
+                    ),
+                );
+            }
+        }
+    }
+    for style in document.text_styles.iter() {
+        if !style.is_shape_file && style.name.trim().is_empty() {
+            // The usual source: the shape-file style behind a complex
+            // linetype, stored without its shape-file flag. Naming the
+            // linetypes that draw from it gives the record its role.
+            let users: Vec<&str> = document
+                .line_types
+                .iter()
+                .filter(|linetype| {
+                    linetype.elements.iter().any(|element| {
+                        element
+                            .complex
+                            .as_ref()
+                            .is_some_and(|complex| complex.style_handle == style.handle)
+                    })
+                })
+                .map(|linetype| linetype.name.as_str())
+                .collect();
+            let message = if users.is_empty() {
+                format!("Text style {:#X} has no name", style.handle.value())
+            } else {
+                format!(
+                    "Text style {:#X} has no name and no shape-file flag, but linetypes {:?} draw shapes from it (font {:?})",
+                    style.handle.value(),
+                    users,
+                    style.font_file
+                )
+            };
+            report("unnamed-text-style", style.handle, "STYLE", message);
+        }
+    }
+    for linetype in document.line_types.iter() {
+        use crate::tables::linetype::LineTypeComplexContent;
+        let unstyled = linetype.elements.iter().enumerate().find_map(|(index, element)| {
+            element.complex.as_ref().and_then(|complex| match complex.content {
+                LineTypeComplexContent::Shape { shape_number } if complex.style_handle.is_null() => {
+                    Some((index, shape_number, complex.source_flags))
+                }
+                _ => None,
+            })
+        });
+        if let Some((index, shape_number, flags)) = unstyled {
+            // Shape 0 under the bare shape flag is what simple linetypes
+            // carry in some files on every segment: a flag with nothing to
+            // draw, as the record stores it.
+            let detail = if shape_number == 0 {
+                format!(" (shape flag {flags:#04X} set, shape number 0, no style: the record names no shape)")
+            } else {
+                format!(" (shape {shape_number})")
+            };
+            report(
+                "shape-without-style",
+                linetype.handle,
+                "LTYPE",
+                format!(
+                    "Linetype {:?} draws a shape at element {index} without a shape-file style{detail}",
+                    linetype.name
+                ),
+            );
+        }
+    }
+}
 use crate::io::dwg::parallel::{filter_map_slice, for_each_mut, map_chunks, map_mut, worker_count};
 use crate::io::read::{push_read_diagnostic, ReadDiagnostic, ReadStage};
 use crate::notification::{NotificationCollection, NotificationType};
 use crate::types::Handle;
 use crate::types::LineWeight;
-use std::collections::{HashMap, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 /// ODA §20.4.89 documents a file-to-extension-dictionary bit before the
 /// default flag on R2010+. AutoCAD does not write that bit for annotative
@@ -181,8 +373,8 @@ fn read_hatch_scale_context_data(
 /// Pending vertex data collected during Pass 2, keyed by owner (parent polyline) handle.
 enum PendingVertex {
     V2D(entities::Vertex2DData),
-    V3D(entities::Vertex3DData, EntityCommon),
-    PfaceFace(entities::PfaceFaceData, EntityCommon),
+    V3D(entities::Vertex3DData, Box<EntityCommon>),
+    PfaceFace(entities::PfaceFaceData, Box<EntityCommon>),
 }
 
 impl PendingVertex {
@@ -232,12 +424,17 @@ fn order_pending_vertices(
     } else {
         return;
     };
-    verts.sort_by_key(|vertex| {
+    let rank = |vertex: &PendingVertex| {
         ranks
             .get(&vertex.handle_value())
             .copied()
             .unwrap_or(usize::MAX)
-    });
+    };
+    // Records usually arrive in drawing order already.
+    if verts.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])) {
+        return;
+    }
+    verts.sort_by_cached_key(rank);
 }
 
 /// Drawing-order ranks from the prev/next chain, when that chain visits
@@ -406,6 +603,7 @@ struct Pass2Chunk {
     pending: PendingPolylines,
     pending_attributes: HashMap<u64, Vec<AttributeEntity>>,
     failures: Vec<RecordFailure>,
+    leader_diagnostics: Vec<ReadDiagnostic>,
     /// (handle, type code, merged bytes, handle bits) — only with ACADRUST_RAW_ALL.
     raw_records: Vec<(u64, i16, Vec<u8>, i64)>,
 }
@@ -414,7 +612,7 @@ struct RecordFailure {
     code: &'static str,
     handle: u64,
     offset: usize,
-    type_code: i16,
+    raw_type_code: i16,
     /// True when a failed auxiliary payload was retained as a validated raw record.
     recoverable: bool,
     message: String,
@@ -437,6 +635,7 @@ impl Pass2Chunk {
             pending: PendingPolylines::default(),
             pending_attributes: HashMap::new(),
             failures: Vec::new(),
+            leader_diagnostics: Vec::new(),
             raw_records: Vec::new(),
         }
     }
@@ -568,6 +767,8 @@ pub struct DwgDocumentBuilder {
     obj_reader: DwgObjectReader,
     /// Whether to use failsafe mode (report skipped records via notifications).
     failsafe: bool,
+    /// See [`crate::DwgReadOptions::skip_roundtrip_data`].
+    skip_roundtrip_data: bool,
     /// Notifications collected during building.
     notifications: NotificationCollection,
     /// Shared with `DwgReader`; reports the object-build portion of the
@@ -602,6 +803,7 @@ impl DwgDocumentBuilder {
         Self {
             obj_reader,
             failsafe: false,
+            skip_roundtrip_data: false,
             notifications: NotificationCollection::new(),
             progress: None,
         }
@@ -613,6 +815,12 @@ impl DwgDocumentBuilder {
     /// instead of being silently lost.
     pub fn set_failsafe(&mut self, failsafe: bool) {
         self.failsafe = failsafe;
+    }
+
+    /// Leave out the verbatim entity bytes kept for a byte-exact re-save
+    /// (see [`crate::DwgReadOptions::skip_roundtrip_data`]).
+    pub fn set_skip_roundtrip_data(&mut self, skip: bool) {
+        self.skip_roundtrip_data = skip;
     }
 
     pub fn set_progress_callback(&mut self, progress: std::sync::Arc<dyn Fn(u16) + Send + Sync>) {
@@ -802,6 +1010,8 @@ impl DwgDocumentBuilder {
         let mut skipped_pass2 = 0u32;
         let mut decoded_pass2 = 0usize;
         let mut diagnostics = Vec::new();
+        let mut leader_diagnostics = Vec::new();
+        let mut preserved_diagnostics = Vec::new();
         let total_handles = handles.len();
         self.report_progress(55);
 
@@ -890,9 +1100,50 @@ impl DwgDocumentBuilder {
         });
         let mut record_catalog = Vec::with_capacity(catalog_results.len());
         let mut skipped_catalog = 0usize;
+        let mut unused_records = 0usize;
         for result in catalog_results {
             match result {
-                Ok(record) => record_catalog.push(record),
+                Ok((handle, _, raw_type_code, type_code)) if is_unused_type(type_code) => {
+                    unused_records += 1;
+                    if unused_records == 1 {
+                        let mut diagnostic = ReadDiagnostic::new(
+                            "unused-object-type",
+                            ReadStage::RecordStream,
+                            format!(
+                                "Ignored a record of unused DWG object type {type_code} at handle {handle:#X}"
+                            ),
+                        );
+                        diagnostic.section = Some("AcDb:AcDbObjects".to_string());
+                        diagnostic.record_handle = Some(handle);
+                        diagnostic.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
+                        push_read_diagnostic(&mut diagnostics, diagnostic);
+                    }
+                }
+                Ok(record) => {
+                    let (handle, offset, raw_type_code, _) = record;
+                    // A code below the class range that names no fixed type is
+                    // most likely a damaged record: the record is still kept
+                    // verbatim, but the caller is told.
+                    if raw_type_code < 500 && fixed_type_name(raw_type_code).is_none() {
+                        let message = format!(
+                            "Record at handle {handle:#X} has unknown fixed object type {raw_type_code}"
+                        );
+                        self.notifications
+                            .notify(NotificationType::Warning, message.clone());
+                        let mut diagnostic = ReadDiagnostic::new(
+                            "unknown-object-type",
+                            ReadStage::RecordStream,
+                            message,
+                        );
+                        diagnostic.source_offset = Some(offset as u64);
+                        diagnostic.source_offset_basis = Some("object-section-byte".to_string());
+                        diagnostic.section = Some("AcDb:AcDbObjects".to_string());
+                        diagnostic.record_handle = Some(handle);
+                        push_read_diagnostic(&mut diagnostics, diagnostic);
+                    }
+                    record_catalog.push(record);
+                }
                 Err((handle, source_offset, failure)) => {
                     skipped_catalog = skipped_catalog.saturating_add(1);
                     let message = match failure {
@@ -933,7 +1184,7 @@ impl DwgDocumentBuilder {
         let pass1_started = web_time::Instant::now();
         let capture_raw_pass1 = std::env::var_os("ACADRUST_RAW_ALL").is_some();
 
-        for &(handle, offset, _, type_code) in &record_catalog {
+        for &(handle, offset, raw_type_code, type_code) in &record_catalog {
             if is_table_type(type_code) {
                 let (_, mut reader) = match self.obj_reader.read_record_at(offset) {
                     Ok(record) => record,
@@ -954,7 +1205,8 @@ impl DwgDocumentBuilder {
                         diagnostic.source_offset_basis = Some("object-section-byte".to_string());
                         diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                         diagnostic.record_handle = Some(handle);
-                        diagnostic.record_type = Some(type_code.to_string());
+                        diagnostic.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
                         push_read_diagnostic(&mut diagnostics, diagnostic);
                         continue;
                     }
@@ -1013,7 +1265,8 @@ impl DwgDocumentBuilder {
                                 Some("object-section-byte".to_string());
                             diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                             diagnostic.record_handle = Some(handle);
-                            diagnostic.record_type = Some(type_code.to_string());
+                            diagnostic.record_type =
+                                Some(Self::record_type_name(&class_names, raw_type_code));
                             push_read_diagnostic(&mut diagnostics, diagnostic);
                             continue;
                         }
@@ -1257,7 +1510,8 @@ impl DwgDocumentBuilder {
                         diagnostic.source_offset_basis = Some("object-section-byte".to_string());
                         diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                         diagnostic.record_handle = Some(handle);
-                        diagnostic.record_type = Some(type_code.to_string());
+                        diagnostic.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
                         push_read_diagnostic(&mut diagnostics, diagnostic);
                     }
                 }
@@ -1331,6 +1585,38 @@ impl DwgDocumentBuilder {
                             maps.blocks.insert(*handle, name);
                         }
                     }
+                }
+            }
+
+            // The header names the model and paper space records by handle. A damaged name
+            // would turn the drawing into an ordinary block: give the records back their
+            // canonical names, and report it.
+            for (active, canonical) in [
+                (active_model, "*Model_Space"),
+                (active_paper, "*Paper_Space"),
+            ] {
+                if active.is_null() {
+                    continue;
+                }
+                for entry in &mut parsed_entries {
+                    let ParsedEntry::Block(h, data) = entry else {
+                        continue;
+                    };
+                    if Handle::from(*h) != active || data.name.eq_ignore_ascii_case(canonical) {
+                        continue;
+                    }
+                    let message = format!(
+                        "Block record {:#X} is the header's {canonical} but is named {:?}; renamed {canonical}",
+                        *h, data.name
+                    );
+                    self.notifications
+                        .notify(NotificationType::Warning, message.clone());
+                    let mut diagnostic =
+                        ReadDiagnostic::new("space-block-renamed", ReadStage::Objects, message);
+                    diagnostic.record_handle = Some(*h);
+                    push_read_diagnostic(&mut diagnostics, diagnostic);
+                    data.name = canonical.to_string();
+                    maps.blocks.insert(*h, data.name.clone());
                 }
             }
 
@@ -2054,7 +2340,7 @@ impl DwgDocumentBuilder {
                                     code: "record-read-failed",
                                     handle,
                                     offset,
-                                    type_code,
+                                    raw_type_code,
                                     recoverable: false,
                                     message: format!(
                                         "Could not read record at handle {handle:#X}, type_code={type_code}: {error}"
@@ -2099,6 +2385,15 @@ impl DwgDocumentBuilder {
                             photometric_lighting,
                         );
                     }));
+                    for mut warning in reader.take_leader_diagnostics() {
+                        warning.source_offset = Some(offset as u64);
+                        warning.source_offset_basis = Some("object-section-byte".into());
+                        warning.section = Some("AcDb:AcDbObjects".into());
+                        warning.record_handle = Some(handle);
+                        warning.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
+                        push_read_diagnostic(&mut chunk.leader_diagnostics, warning);
+                    }
                     if let Some(message) = reader
                         .check_error()
                         .err()
@@ -2194,7 +2489,7 @@ impl DwgDocumentBuilder {
                             },
                             handle,
                             offset,
-                            type_code,
+                            raw_type_code,
                             recoverable,
                             message: if recoverable {
                                 let name = Self::unknown_object_type_name(&class_names, raw_type_code);
@@ -2314,6 +2609,9 @@ impl DwgDocumentBuilder {
                         .or_default()
                         .append(&mut attributes);
                 }
+                for warning in chunk.leader_diagnostics {
+                    push_read_diagnostic(&mut leader_diagnostics, warning);
+                }
                 for failure in chunk.failures {
                     if !failure.recoverable {
                         skipped_pass2 += 1;
@@ -2326,8 +2624,13 @@ impl DwgDocumentBuilder {
                     diagnostic.source_offset_basis = Some("object-section-byte".to_string());
                     diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                     diagnostic.record_handle = Some(failure.handle);
-                    diagnostic.record_type = Some(failure.type_code.to_string());
-                    push_read_diagnostic(&mut diagnostics, diagnostic);
+                    diagnostic.record_type =
+                        Some(Self::record_type_name(&class_names, failure.raw_type_code));
+                    if failure.recoverable {
+                        push_read_diagnostic(&mut preserved_diagnostics, diagnostic);
+                    } else {
+                        push_read_diagnostic(&mut diagnostics, diagnostic);
+                    }
                 }
                 for (warning_handle, message) in chunk.output.warnings.drain(..) {
                     self.notifications
@@ -2354,6 +2657,15 @@ impl DwgDocumentBuilder {
                 worker_count,
             );
         }
+        // Strict reads use the first diagnostic to explain a skipped record.
+        // Append preserved-object notices after the record failures so that
+        // they cannot use the failures' diagnostic budget.
+        for diagnostic in preserved_diagnostics {
+            push_read_diagnostic(&mut diagnostics, diagnostic);
+        }
+        // Every record is decoded; the post-pass reads no section bytes.
+        self.obj_reader.release_section();
+        drop(pass2_records);
         let post_started = web_time::Instant::now();
         self.report_progress(875);
 
@@ -2392,10 +2704,10 @@ impl DwgDocumentBuilder {
                         e.vertices = verts
                             .into_iter()
                             .filter_map(|v| {
-                                if let PendingVertex::V3D(d, _ec) = v {
+                                if let PendingVertex::V3D(d, ec) = v {
                                     Some(crate::entities::polyline3d::Vertex3DPolyline {
                                         handle: d.handle,
-                                        layer: String::new(),
+                                        layer: ec.layer,
                                         position: d.position,
                                         flags: d.flags as i32,
                                     })
@@ -2410,7 +2722,7 @@ impl DwgDocumentBuilder {
                             match v {
                                 PendingVertex::V3D(d, ec) => {
                                     e.vertices.push(crate::entities::polyface_mesh::PolyfaceVertex {
-                                        common: ec,
+                                        common: *ec,
                                         location: d.position,
                                         flags: crate::entities::polyface_mesh::PolyfaceVertexFlags::from_bits_truncate(d.flags as i16),
                                         bulge: 0.0,
@@ -2422,7 +2734,7 @@ impl DwgDocumentBuilder {
                                 }
                                 PendingVertex::PfaceFace(f, ec) => {
                                     e.faces.push(crate::entities::polyface_mesh::PolyfaceFace {
-                                        common: ec,
+                                        common: *ec,
                                         flags: crate::entities::polyface_mesh::PolyfaceVertexFlags::NONE,
                                         index1: f.index1,
                                         index2: f.index2,
@@ -2443,13 +2755,11 @@ impl DwgDocumentBuilder {
                         e.vertices = verts
                             .into_iter()
                             .filter_map(|v| {
-                                if let PendingVertex::V3D(d, _ec) = v {
-                                    let mut c = crate::entities::EntityCommon::new();
-                                    c.handle = d.handle;
+                                if let PendingVertex::V3D(d, ec) = v {
                                     Some(crate::entities::polygon_mesh::PolygonMeshVertex {
-                                        common: c,
+                                        common: *ec,
                                         location: d.position,
-                                        flags: 0,
+                                        flags: i16::from(d.flags),
                                     })
                                 } else {
                                     None
@@ -2577,6 +2887,7 @@ impl DwgDocumentBuilder {
         }
 
         document.resolve_xrecord_names();
+        document.resolve_table_style_names();
 
         // Advanced material properties are not stored in the AcDbMaterial
         // object body. ACAD keeps them in the ADVMATERIAL XRECORD owned by
@@ -2719,73 +3030,6 @@ impl DwgDocumentBuilder {
         if max_from_reader + 1 > document.header.handle_seed {
             document.header.handle_seed = max_from_reader + 1;
         }
-
-        // BLOCK/ENDBLK markers are structural records and are not retained in
-        // the flat entity arena. Damaged files can point a block record at a
-        // handle now occupied by a table entry or ordinary object (0718 uses
-        // its Standard DIMSTYLE as *Paper_Space's BLOCK marker). Rehome only
-        // those colliding markers; the writer will synthesize their records.
-        let mut occupied: std::collections::HashSet<Handle> =
-            document.objects.keys().copied().collect();
-        occupied.extend(document.entities().filter_map(|entity| {
-            (!matches!(
-                entity,
-                crate::entities::EntityType::Block(_) | crate::entities::EntityType::BlockEnd(_)
-            ))
-            .then_some(entity.common().handle)
-        }));
-        for handle in [
-            document.block_records.handle(),
-            document.layers.handle(),
-            document.text_styles.handle(),
-            document.line_types.handle(),
-            document.views.handle(),
-            document.ucss.handle(),
-            document.vports.handle(),
-            document.app_ids.handle(),
-            document.dim_styles.handle(),
-            document.vx_table.handle(),
-        ] {
-            occupied.insert(handle);
-        }
-        occupied.extend(document.block_records.iter().map(|record| record.handle));
-        occupied.extend(document.layers.iter().map(|entry| entry.handle));
-        occupied.extend(document.text_styles.iter().map(|entry| entry.handle));
-        occupied.extend(document.line_types.iter().map(|entry| entry.handle));
-        occupied.extend(document.views.iter().map(|entry| entry.handle));
-        occupied.extend(document.ucss.iter().map(|entry| entry.handle));
-        occupied.extend(document.vports.iter().map(|entry| entry.handle));
-        occupied.extend(document.app_ids.iter().map(|entry| entry.handle));
-        occupied.extend(document.dim_styles.iter().map(|entry| entry.handle));
-        occupied.extend(document.vx_table.iter().map(|entry| entry.handle));
-        fn allocate_marker(
-            occupied: &mut std::collections::HashSet<Handle>,
-            next_handle: &mut u64,
-        ) -> Handle {
-            while occupied.contains(&Handle::new(*next_handle)) {
-                *next_handle += 1;
-            }
-            let handle = Handle::new(*next_handle);
-            *next_handle += 1;
-            occupied.insert(handle);
-            handle
-        }
-        let mut next_handle = document.header.handle_seed.max(1);
-        for record in document.block_records.iter_mut() {
-            if record.block_entity_handle.is_null()
-                || occupied.contains(&record.block_entity_handle)
-            {
-                record.block_entity_handle = allocate_marker(&mut occupied, &mut next_handle);
-            } else {
-                occupied.insert(record.block_entity_handle);
-            }
-            if record.block_end_handle.is_null() || occupied.contains(&record.block_end_handle) {
-                record.block_end_handle = allocate_marker(&mut occupied, &mut next_handle);
-            } else {
-                occupied.insert(record.block_end_handle);
-            }
-        }
-        document.header.handle_seed = document.header.handle_seed.max(next_handle);
 
         // ── Post-pass: Resolve root dictionary handle ──────────────────
         //
@@ -3006,6 +3250,8 @@ impl DwgDocumentBuilder {
             }
         }
 
+        document.name_mleader_styles_from_dictionary();
+
         // Summary notification
         let total_skipped = skipped_catalog
             .saturating_add(skipped_pass1 as usize)
@@ -3164,7 +3410,7 @@ impl DwgDocumentBuilder {
                 .collect();
             if !app_name_by_handle.is_empty() {
                 for_each_mut(&mut document.entities, |entity| {
-                    let records: Vec<crate::xdata::ExtendedDataRecord> = {
+                    let records: Vec<(u64, crate::xdata::ExtendedDataRecord)> = {
                         let xd = &entity.common().extended_data;
                         xd.raw_dwg_eed
                             .iter()
@@ -3182,15 +3428,33 @@ impl DwgDocumentBuilder {
                                     let mut rec =
                                         crate::xdata::ExtendedDataRecord::new(name.clone());
                                     rec.values = values;
-                                    rec
+                                    (*app_handle, rec)
                                 })
                             })
                             .collect()
                     };
                     if !records.is_empty() {
                         let xd = &mut std::sync::Arc::make_mut(entity).common_mut().extended_data;
-                        for record in records {
+                        if self.skip_roundtrip_data {
+                            // A decoded block is only kept for a byte-exact re-save.
+                            xd.raw_dwg_eed
+                                .retain(|(app, _)| !records.iter().any(|(decoded, _)| decoded == app));
+                            xd.raw_dwg_eed.shrink_to_fit();
+                        }
+                        for (_, record) in records {
                             xd.add_record(record);
+                        }
+                    }
+                    // R2007 to R2013 keep MTEXT columns in ACAD extended data.
+                    let columns = match entity.as_ref() {
+                        EntityType::MText(m) if m.column_data.column_type == 0 => {
+                            MTextColumnData::from_acad_xdata(&m.common.extended_data)
+                        }
+                        _ => None,
+                    };
+                    if let Some(columns) = columns {
+                        if let EntityType::MText(m) = std::sync::Arc::make_mut(entity) {
+                            m.column_data = columns;
                         }
                     }
                     if self.obj_reader.version().r13_14_only() {
@@ -3211,7 +3475,7 @@ impl DwgDocumentBuilder {
                 });
                 // Objects keep their EED in `eed_by_handle`; decode it the
                 // same way so the DXF writer can write it after the object.
-                let mut object_xdata = HashMap::new();
+                let mut object_xdata = std::collections::HashMap::new();
                 for (handle, blocks) in &document.eed_by_handle {
                     match document.objects.get(handle) {
                         // FIELD decodes its XDATA onto `Field::xdata` itself.
@@ -3521,6 +3785,77 @@ impl DwgDocumentBuilder {
             }
         }
 
+        // Runs after the handle-collision repair: a default entry seeded at a
+        // low handle before the file was read (the ACAD APPID, Standard
+        // styles) is moved off a source handle there, so it no longer looks
+        // like it occupies the file's own BLOCK/ENDBLK marker (acadrust #136).
+        // BLOCK/ENDBLK markers are structural records and are not retained in
+        // the flat entity arena. Damaged files can point a block record at a
+        // handle now occupied by a table entry or ordinary object (0718 uses
+        // its Standard DIMSTYLE as *Paper_Space's BLOCK marker). Rehome only
+        // those colliding markers; the writer will synthesize their records.
+        let mut occupied: std::collections::HashSet<Handle> =
+            document.objects.keys().copied().collect();
+        occupied.extend(document.entities().filter_map(|entity| {
+            (!matches!(
+                entity,
+                crate::entities::EntityType::Block(_) | crate::entities::EntityType::BlockEnd(_)
+            ))
+            .then_some(entity.common().handle)
+        }));
+        for handle in [
+            document.block_records.handle(),
+            document.layers.handle(),
+            document.text_styles.handle(),
+            document.line_types.handle(),
+            document.views.handle(),
+            document.ucss.handle(),
+            document.vports.handle(),
+            document.app_ids.handle(),
+            document.dim_styles.handle(),
+            document.vx_table.handle(),
+        ] {
+            occupied.insert(handle);
+        }
+        occupied.extend(document.block_records.iter().map(|record| record.handle));
+        occupied.extend(document.layers.iter().map(|entry| entry.handle));
+        occupied.extend(document.text_styles.iter().map(|entry| entry.handle));
+        occupied.extend(document.line_types.iter().map(|entry| entry.handle));
+        occupied.extend(document.views.iter().map(|entry| entry.handle));
+        occupied.extend(document.ucss.iter().map(|entry| entry.handle));
+        occupied.extend(document.vports.iter().map(|entry| entry.handle));
+        occupied.extend(document.app_ids.iter().map(|entry| entry.handle));
+        occupied.extend(document.dim_styles.iter().map(|entry| entry.handle));
+        occupied.extend(document.vx_table.iter().map(|entry| entry.handle));
+        fn allocate_marker(
+            occupied: &mut std::collections::HashSet<Handle>,
+            next_handle: &mut u64,
+        ) -> Handle {
+            while occupied.contains(&Handle::new(*next_handle)) {
+                *next_handle += 1;
+            }
+            let handle = Handle::new(*next_handle);
+            *next_handle += 1;
+            occupied.insert(handle);
+            handle
+        }
+        let mut next_handle = document.header.handle_seed.max(1);
+        for record in document.block_records.iter_mut() {
+            if record.block_entity_handle.is_null()
+                || occupied.contains(&record.block_entity_handle)
+            {
+                record.block_entity_handle = allocate_marker(&mut occupied, &mut next_handle);
+            } else {
+                occupied.insert(record.block_entity_handle);
+            }
+            if record.block_end_handle.is_null() || occupied.contains(&record.block_end_handle) {
+                record.block_end_handle = allocate_marker(&mut occupied, &mut next_handle);
+            } else {
+                occupied.insert(record.block_end_handle);
+            }
+        }
+        document.header.handle_seed = document.header.handle_seed.max(next_handle);
+
         document.header.current_layer_name = document
             .layers
             .iter()
@@ -3705,6 +4040,15 @@ impl DwgDocumentBuilder {
                 tail_started.elapsed().as_secs_f64() * 1000.0,
                 build_started.elapsed().as_secs_f64() * 1000.0,
             );
+        }
+
+        source_state_diagnostics(document, &mut diagnostics);
+
+        // Strict reads use the first diagnostic to explain a skipped record.
+        // Append leader warnings after existing diagnostics so they cannot
+        // mask a decoding failure or use its diagnostic budget.
+        for warning in leader_diagnostics {
+            crate::io::leader_codes::report(&mut self.notifications, &mut diagnostics, warning);
         }
 
         DwgBuildOutcome {
@@ -3899,11 +4243,13 @@ impl DwgDocumentBuilder {
             );
             // Keep the verbatim record so an untouched entity can be copied on write
             // instead of re-encoded (see EntityCommon::raw_record).
-            entity_common.raw_record = Some(std::sync::Arc::new(crate::entities::RawRecord {
-                data: reader.raw_merged_data(),
-                handle_bits: reader.get_handle_bits(),
-                version: self.obj_reader.dxf_version(),
-            }));
+            if !self.skip_roundtrip_data {
+                entity_common.raw_record = Some(std::sync::Arc::new(crate::entities::RawRecord {
+                    data: reader.raw_merged_data(),
+                    handle_bits: reader.get_handle_bits(),
+                    version: self.obj_reader.dxf_version(),
+                }));
+            }
 
             match type_code {
                 // ── Simple entities ────────────────────────────────
@@ -4123,9 +4469,7 @@ impl DwgDocumentBuilder {
                     let block_name = maps.block_name(data.block_handle);
                     let mut e = Insert::new(block_name, data.insert_point);
                     e.common = entity_common;
-                    e.set_x_scale(data.x_scale);
-                    e.set_y_scale(data.y_scale);
-                    e.set_z_scale(data.z_scale);
+                    e.set_scale_unchecked(data.x_scale, data.y_scale, data.z_scale);
                     e.rotation = data.rotation;
                     e.normal = data.normal;
                     e.view_rep_handle = view_rep_handle;
@@ -4136,9 +4480,11 @@ impl DwgDocumentBuilder {
                     let block_name = maps.block_name(data.insert.block_handle);
                     let mut e = Insert::new(block_name, data.insert.insert_point);
                     e.common = entity_common;
-                    e.set_x_scale(data.insert.x_scale);
-                    e.set_y_scale(data.insert.y_scale);
-                    e.set_z_scale(data.insert.z_scale);
+                    e.set_scale_unchecked(
+                        data.insert.x_scale,
+                        data.insert.y_scale,
+                        data.insert.z_scale,
+                    );
                     e.rotation = data.insert.rotation;
                     e.normal = data.insert.normal;
                     e.column_count = data.column_count as u16;
@@ -4395,7 +4741,7 @@ impl DwgDocumentBuilder {
                     e.direction = data.direction;
                     e.normal = data.normal;
                     e.dimension_style_handle = Some(Handle::from(data.dimstyle_handle));
-                    e.dimension_style_name.clear();
+                    e.dimension_style_name = maps.dimstyle_name(data.dimstyle_handle);
                     e.dwg_unknown_short = data.unknown_short;
                     e.text_height = data.text_height;
                     e.dimension_gap = data.dimgap;
@@ -4985,6 +5331,7 @@ impl DwgDocumentBuilder {
                     e.common = entity_common;
                     e.insertion_point = data.text_data.insertion_point;
                     e.height = data.text_data.height;
+                    e.thickness = data.text_data.thickness;
                     e.rotation = data.text_data.rotation;
                     // Carry the full text geometry the reader parsed — same as
                     // ATTRIB. Without these the attribute reverts to
@@ -5040,6 +5387,7 @@ impl DwgDocumentBuilder {
                     e.common = entity_common;
                     e.insertion_point = data.text_data.insertion_point;
                     e.height = data.text_data.height;
+                    e.thickness = data.text_data.thickness;
                     e.rotation = data.text_data.rotation;
                     // Carry the full text geometry the reader parsed. Without
                     // these the attribute reverts to left/baseline with no
@@ -5144,7 +5492,7 @@ impl DwgDocumentBuilder {
                         .vertices
                         .entry(entity_data.owner_handle)
                         .or_default()
-                        .push(PendingVertex::V3D(data, entity_common));
+                        .push(PendingVertex::V3D(data, Box::new(entity_common)));
                 }
                 OBJ_VERTEX_PFACE => {
                     let mut data = entities::read_vertex3d(&mut reader);
@@ -5153,7 +5501,7 @@ impl DwgDocumentBuilder {
                         .vertices
                         .entry(entity_data.owner_handle)
                         .or_default()
-                        .push(PendingVertex::V3D(data, entity_common));
+                        .push(PendingVertex::V3D(data, Box::new(entity_common)));
                 }
                 OBJ_VERTEX_PFACE_FACE => {
                     let mut data = entities::read_pface_face(&mut reader);
@@ -5162,7 +5510,7 @@ impl DwgDocumentBuilder {
                         .vertices
                         .entry(entity_data.owner_handle)
                         .or_default()
-                        .push(PendingVertex::PfaceFace(data, entity_common));
+                        .push(PendingVertex::PfaceFace(data, Box::new(entity_common)));
                 }
 
                 // ── Underlay reference (PDF / DWF / DGN) ───────────
@@ -5276,10 +5624,7 @@ impl DwgDocumentBuilder {
                     let mut e = Ole2Frame::new();
                     e.common = entity_common;
                     e.ole_object_type = OleObjectType::from_i16(data.object_type);
-                    e.upper_left_corner = data.upper_left;
-                    e.lower_right_corner = data.lower_right;
-                    e.storage = data.storage;
-                    e.envelope = data.envelope;
+                    (e.upper_left_corner, e.lower_right_corner) = e.set_payload(&data.data);
                     e.dwg_mode = data.mode;
                     e.is_paper_space = data.mode == 1;
                     e.lock_aspect = data.lock_aspect;
@@ -6002,10 +6347,12 @@ impl DwgDocumentBuilder {
                             } else {
                                 // Pre-R2018: a bit_short index into the linetypes
                                 // in table order (ByBlock/ByLayer excluded);
-                                // 0x7FFF means ByLayer.
+                                // 0x7FFF means ByLayer, 0x7FFE ByBlock.
                                 let idx = e.linetype_index_or_handle;
                                 if idx == 0x7FFF {
                                     "ByLayer".to_string()
+                                } else if idx == 0x7FFE {
+                                    "ByBlock".to_string()
                                 } else {
                                     maps.linetype_order
                                         .get(idx as usize)
@@ -6217,6 +6564,12 @@ impl DwgDocumentBuilder {
                     obj.pixel_size = (data.pixel_size.x, data.pixel_size.y);
                     obj.resolution_unit =
                         crate::objects::ResolutionUnit::from_code(data.resolution_unit as i32);
+                    // The list lives on the object; drop the side-map copy so
+                    // the writer cannot bring back a list the caller emptied.
+                    obj.reactors = document
+                        .reactors_by_handle
+                        .remove(&Handle::from(handle))
+                        .unwrap_or_default();
                     document.objects.insert(
                         Handle::from(handle),
                         crate::objects::ObjectType::ImageDefinition(obj),
@@ -6250,7 +6603,9 @@ impl DwgDocumentBuilder {
                             crate::objects::ImageDefinitionReactor {
                                 handle: Handle::from(handle),
                                 owner: owner_handle,
-                                image_handle: Handle::NULL,
+                                // The image owns its reactor; DWG stores no
+                                // separate image link.
+                                image_handle: owner_handle,
                             },
                         ),
                     );
@@ -6369,36 +6724,18 @@ impl DwgDocumentBuilder {
                     }
                 }
                 OBJ_PROXY_OBJECT => {
-                    let class_id = reader.read_bit_long();
-                    let dxf_subclass = if self.obj_reader.dxf_version()
-                        > crate::types::DxfVersion::AC1015
-                    {
-                        reader.read_variable_text()
-                    } else {
-                        String::new()
-                    };
-                    let (version, dwg_version, maintenance_version) = if self
-                        .obj_reader
-                        .version()
-                        .r2018_plus(self.obj_reader.dxf_version())
-                    {
-                        let dwg_version = reader.read_bit_long();
-                        let maintenance_version = reader.read_bit_long();
-                        (
-                            (maintenance_version << 16)
-                                | (dwg_version & 0xffff),
-                            dwg_version,
-                            maintenance_version,
-                        )
-                    } else {
-                        let version = reader.read_bit_long();
-                        (version, version & 0xffff, version >> 16)
-                    };
-                    let from_dxf = if self.obj_reader.version().r2000_plus() {
-                        reader.read_bit()
-                    } else {
-                        false
-                    };
+                    let entities::ProxyFields {
+                        class_id,
+                        dxf_subclass,
+                        version,
+                        dwg_version,
+                        maintenance_version,
+                        from_dxf,
+                    } = entities::read_proxy_fields(
+                        &mut reader,
+                        self.obj_reader.version(),
+                        self.obj_reader.dxf_version(),
+                    );
                     let object_data_bits = reader.main_remaining_bits() as u32;
                     let mut object_data =
                         vec![0u8; object_data_bits.div_ceil(8) as usize];
@@ -6505,6 +6842,7 @@ impl DwgDocumentBuilder {
                                         text_data_bits,
                                     ),
                                 object_ids,
+                                dxf_data: Vec::new(),
                             },
                         )
                     };
@@ -6554,7 +6892,7 @@ impl DwgDocumentBuilder {
                         crate::objects::ObjectType::Material(obj),
                     );
                 }
-                OBJ_TABLECONTENT => {
+                OBJ_TABLECONTENT | OBJ_TABLETEMPLATE => {
                     let (
                         name,
                         description,
@@ -6594,10 +6932,12 @@ impl DwgDocumentBuilder {
                     obj.sync_cells_from_merged_ranges();
                     obj.table_style_handle = (style_handle != 0)
                         .then(|| Handle::from(style_handle));
-                    document.objects.insert(
-                        Handle::from(handle),
-                        crate::objects::ObjectType::TableContent(obj),
-                    );
+                    let object = if type_code == OBJ_TABLETEMPLATE {
+                        crate::objects::ObjectType::TableTemplate(obj)
+                    } else {
+                        crate::objects::ObjectType::TableContent(obj)
+                    };
+                    document.objects.insert(Handle::from(handle), object);
                 }
                 OBJ_TABLESTYLE => {
                     let mut obj =
@@ -7307,58 +7647,87 @@ impl DwgDocumentBuilder {
                                 // the historical one-bit base (default flag),
                                 // while the generic ODA §20.4.89 layout has a
                                 // preceding file-to-extension-dictionary bit.
-                                // Try the native form first and fall back to
-                                // the two-bit ODA form when its bounded decode
-                                // rejects the payload (issue134/native reA).
+                                // A record is in the form whose decode ends
+                                // exactly at the end of its data. The wrong
+                                // form can decode without an error: a two-bit
+                                // record of a default context reads as a
+                                // native one with no leader roots and leaves
+                                // most of the record unread.
+                                let version = self.obj_reader.version();
+                                let dxf_version = self.obj_reader.dxf_version();
                                 let mut legacy = reader.clone();
                                 let legacy_is_default = legacy.read_bit();
                                 let legacy_scale = legacy.read_handle();
                                 let legacy_context =
                                     entities::read_multileader_annotation_context(
                                         &mut legacy,
-                                        self.obj_reader.version(),
-                                        self.obj_reader.dxf_version(),
+                                        version,
+                                        dxf_version,
                                         true,
                                     );
                                 let legacy_ok = legacy.check_error().is_ok();
+                                let legacy_fits =
+                                    legacy_ok && legacy.main_remaining_bits() == 0;
+                                let oda = if legacy_fits {
+                                    None
+                                } else {
+                                    let mut oda = reader.clone();
+                                    let has_file_to_extension_dictionary =
+                                        read_oda_context_file_dictionary_flag(
+                                            &mut oda, version,
+                                        );
+                                    let is_default = oda.read_bit();
+                                    let scale = oda.read_handle();
+                                    let context =
+                                        entities::read_multileader_annotation_context(
+                                            &mut oda,
+                                            version,
+                                            dxf_version,
+                                            true,
+                                        );
+                                    let oda_fits = oda.check_error().is_ok()
+                                        && oda.main_remaining_bits() == 0;
+                                    // Without an exact fit on either side keep
+                                    // the native reading when it has no error.
+                                    (oda_fits || !legacy_ok).then_some((
+                                        oda,
+                                        has_file_to_extension_dictionary,
+                                        is_default,
+                                        scale,
+                                        context,
+                                    ))
+                                };
                                 let (
                                     has_file_to_extension_dictionary,
                                     is_default,
                                     scale,
                                     context,
-                                ) = if legacy_ok {
-                                    *reader = legacy;
-                                    uses_legacy_mleader_context_base = true;
-                                    (
-                                        true,
-                                        legacy_is_default,
-                                        legacy_scale,
-                                        legacy_context,
-                                    )
-                                } else {
-                                    // ODA §20.4.89 layout: the dictionary bit
-                                    // is present. Native AutoCAD records take
-                                    // the branch above and never reach here.
-                                    let has_file_to_extension_dictionary =
-                                        read_oda_context_file_dictionary_flag(
-                                            &mut reader,
-                                            self.obj_reader.version(),
-                                        );
-                                    let is_default = reader.read_bit();
-                                    let scale = reader.read_handle();
-                                    let context =
-                                        entities::read_multileader_annotation_context(
-                                            &mut reader,
-                                            self.obj_reader.version(),
-                                            self.obj_reader.dxf_version(),
-                                            true,
-                                        );
-                                    (
+                                ) = match oda {
+                                    Some((
+                                        oda,
                                         has_file_to_extension_dictionary,
                                         is_default,
                                         scale,
                                         context,
-                                    )
+                                    )) => {
+                                        *reader = oda;
+                                        (
+                                            has_file_to_extension_dictionary,
+                                            is_default,
+                                            scale,
+                                            context,
+                                        )
+                                    }
+                                    None => {
+                                        *reader = legacy;
+                                        uses_legacy_mleader_context_base = true;
+                                        (
+                                            true,
+                                            legacy_is_default,
+                                            legacy_scale,
+                                            legacy_context,
+                                        )
+                                    }
                                 };
                                 Some((
                                     crate::objects::ObjectContextKind::MLeader(
@@ -8017,6 +8386,14 @@ impl DwgDocumentBuilder {
         Some((object, common, scale))
     }
 
+    /// Name a record's type for diagnostics: the DXF name of a fixed type,
+    /// otherwise its class name, as for an unsupported object.
+    fn record_type_name(class_names: &ClassNames, raw_type_code: i16) -> String {
+        fixed_type_name(raw_type_code)
+            .map(str::to_string)
+            .unwrap_or_else(|| Self::unknown_object_type_name(class_names, raw_type_code))
+    }
+
     /// Name an unsupported object by its CLASSES-section dxfname when the
     /// drawing's class map knows it, falling back to the positional code.
     fn unknown_object_type_name(class_names: &ClassNames, raw_type_code: i16) -> String {
@@ -8252,6 +8629,43 @@ mod tests {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ]
+        );
+    }
+
+    /// An unnamed ordinary STYLE that complex linetypes draw shapes from is
+    /// the shape-file style behind them, stored without its shape-file flag;
+    /// the read names that role instead of reporting a bare unnamed style
+    /// (#311). The DWG writer writes such a style with the flag (#370), so
+    /// the document is checked as a file from another writer reads.
+    #[test]
+    fn unnamed_style_names_the_linetypes_that_use_it() {
+        use crate::tables::linetype::LineTypeComplexContent;
+        use crate::tables::{LineType, LineTypeComplexData, LineTypeElement, TextStyle};
+        let mut document = CadDocument::new();
+        let mut style = TextStyle::new("");
+        style.font_file = "ltypeshp.shx".into();
+        style.handle = Handle::new(0x500);
+        document.text_styles.add_allow_duplicate(style);
+        let mut linetype = LineType::new("ZIGZAG");
+        let mut dash = LineTypeElement::dash(0.0);
+        dash.complex = Some(LineTypeComplexData {
+            content: LineTypeComplexContent::Shape { shape_number: 131 },
+            style_handle: Handle::new(0x500),
+            ..LineTypeComplexData::default()
+        });
+        linetype.elements.push(dash);
+        document.line_types.add(linetype).unwrap();
+
+        let mut diagnostics = Vec::new();
+        source_state_diagnostics(&document, &mut diagnostics);
+        let message = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "unnamed-text-style")
+            .map(|diagnostic| diagnostic.message.as_str())
+            .expect("the unnamed style is reported");
+        assert!(
+            message.contains("ZIGZAG") && message.contains("ltypeshp.shx"),
+            "{message}"
         );
     }
 }
@@ -8679,7 +9093,13 @@ fn map_dimension_common(
     base.insertion_point =
         crate::types::Vector3::new(common.insertion_point.x, common.insertion_point.y, 0.0);
     base.style_name = maps.dimstyle_name(common.dimstyle_handle);
-    base.block_name = maps.block_name(common.block_handle);
+    // A dimension without a geometry block (null handle) keeps an empty name:
+    // a made-up `*U0` would be written back as a reference to a missing block.
+    base.block_name = if common.block_handle == 0 {
+        String::new()
+    } else {
+        maps.block_name(common.block_handle)
+    };
 }
 
 fn map_entity_common(
@@ -8753,7 +9173,7 @@ fn map_entity_common(
 mod vertex_chain_tests {
     use super::vertex_chain_ranks;
     use crate::types::Handle;
-    use std::collections::HashMap;
+    use foldhash::{HashMap, HashMapExt};
 
     fn links(pairs: &[(u64, u64)]) -> HashMap<Handle, Handle> {
         pairs
@@ -8787,15 +9207,78 @@ mod vertex_chain_tests {
 }
 
 #[cfg(test)]
+mod pending_vertex_order_tests {
+    use super::{entities, order_pending_vertices, PendingVertex};
+    use crate::entities::EntityCommon;
+    use crate::types::{Handle, Vector3};
+    use foldhash::{HashMap, HashMapExt};
+
+    fn vertices(handles: &[u64]) -> Vec<PendingVertex> {
+        handles
+            .iter()
+            .map(|handle| {
+                PendingVertex::V3D(
+                    entities::Vertex3DData {
+                        handle: Handle::new(*handle),
+                        flags: 0,
+                        position: Vector3::ZERO,
+                    },
+                    Box::new(EntityCommon::new()),
+                )
+            })
+            .collect()
+    }
+
+    fn ordered(handles: &[u64], owned: &[u64]) -> Vec<u64> {
+        let mut list = vertices(handles);
+        order_pending_vertices(&mut list, Some(owned), &HashMap::new());
+        list.iter().map(PendingVertex::handle_value).collect()
+    }
+
+    #[test]
+    fn vertices_already_in_order_stay_there() {
+        assert_eq!(ordered(&[1, 2, 3], &[1, 2, 3]), [1, 2, 3]);
+    }
+
+    #[test]
+    fn vertices_out_of_order_follow_the_owned_list() {
+        assert_eq!(ordered(&[1, 2, 3, 4], &[3, 1, 4, 2]), [3, 1, 4, 2]);
+        assert_eq!(ordered(&[1, 2, 3], &[3, 2, 1]), [3, 2, 1]);
+    }
+
+    #[test]
+    fn vertices_the_list_does_not_name_go_last_in_their_own_order() {
+        assert_eq!(ordered(&[9, 1, 8, 2], &[2, 1]), [2, 1, 9, 8]);
+        // Already in order by rank, including the unnamed tail.
+        assert_eq!(ordered(&[1, 2, 9, 8], &[1, 2]), [1, 2, 9, 8]);
+    }
+
+    #[test]
+    fn many_vertices_the_list_does_not_name_keep_their_order() {
+        let handles: Vec<u64> = (0..200).map(|i| (i * 37) % 200 + 10).collect();
+        let mut expected = vec![5];
+        expected.extend(&handles);
+        let mut input = handles;
+        input.insert(100, 5);
+        assert_eq!(ordered(&input, &[5]), expected);
+    }
+
+    #[test]
+    fn an_empty_list_with_no_chain_leaves_the_order_alone() {
+        assert_eq!(ordered(&[3, 1, 2], &[]), [3, 1, 2]);
+    }
+}
+
+#[cfg(test)]
 mod block_entity_chain_tests {
     use super::DwgDocumentBuilder;
     use crate::types::Handle;
-    use std::collections::HashMap;
+    use foldhash::HashMap;
 
     #[test]
     fn damaged_block_entity_chains_terminate_at_cycles_nulls_and_missing_records() {
         for next in [10, 0, 30] {
-            let links = HashMap::from([
+            let links = HashMap::from_iter([
                 (Handle::new(10), Handle::new(20)),
                 (Handle::new(20), Handle::new(next)),
             ]);
@@ -8804,7 +9287,7 @@ mod block_entity_chain_tests {
                 [Handle::new(10), Handle::new(20)]
             );
         }
-        let links = HashMap::from([(Handle::new(10), Handle::new(20))]);
+        let links = HashMap::from_iter([(Handle::new(10), Handle::new(20))]);
         assert!(DwgDocumentBuilder::block_entity_chain(0, 10, &links).is_empty());
         assert!(DwgDocumentBuilder::block_entity_chain(10, 0, &links).is_empty());
         assert!(DwgDocumentBuilder::block_entity_chain(30, 40, &links).is_empty());
@@ -8812,7 +9295,7 @@ mod block_entity_chain_tests {
 
     #[test]
     fn block_entity_chain_stops_at_last_even_when_a_next_link_exists() {
-        let links = HashMap::from([
+        let links = HashMap::from_iter([
             (Handle::new(10), Handle::new(20)),
             (Handle::new(20), Handle::new(30)),
             (Handle::new(30), Handle::NULL),

@@ -304,6 +304,7 @@ pub(crate) fn object_class_names(object: &ObjectType) -> Vec<std::borrow::Cow<'_
         ObjectType::GeoData(_) => "GEODATA",
         ObjectType::BlockVisibilityParameter(_) => "BLOCKVISIBILITYPARAMETER",
         ObjectType::TableContent(_) => "TABLECONTENT",
+        ObjectType::TableTemplate(_) => "TABLETEMPLATE",
         ObjectType::VisualStyle(_) => "VISUALSTYLE",
         ObjectType::Material(_) => "MATERIAL",
         ObjectType::TableStyle(_) => "TABLESTYLE",
@@ -322,7 +323,9 @@ pub(crate) fn object_class_names(object: &ObjectType) -> Vec<std::borrow::Cow<'_
         {
             value.dxf_name()
         }
-        ObjectType::RegisteredClass(value) if value.properties.is_empty() => &value.dxf_name,
+        // A record with properties is written as a proxy that names this
+        // class, so the class is needed either way.
+        ObjectType::RegisteredClass(value) => &value.dxf_name,
         ObjectType::Associative(value) => {
             let canonical = associative_canonical_name(&value.dxf_name);
             return vec![
@@ -480,6 +483,7 @@ impl<'a> DwgObjectWriter<'a> {
             ObjectType::VisualStyle(v) => self.write_visual_style(v),
             ObjectType::Material(m) => self.write_material(m),
             ObjectType::TableContent(t) => self.write_table_content_object(t),
+            ObjectType::TableTemplate(t) => self.write_table_template_object(t),
             ObjectType::TableStyle(t) => self.write_table_style(t),
             ObjectType::Unknown {
                 handle,
@@ -512,19 +516,17 @@ impl<'a> DwgObjectWriter<'a> {
                 &value.reactors,
                 &value.xdictionary_handle,
             );
-            self.writer.write_bit_long(499);
-            if self.dxf_version > crate::types::DxfVersion::AC1015 {
-                self.writer.write_variable_text(&value.dxf_name);
-            }
-            if self.version.r2018_plus(self.dxf_version) {
-                self.writer.write_bit_long(0);
-                self.writer.write_bit_long(0);
-            } else {
-                self.writer.write_bit_long(0);
-            }
-            if self.version.r2000_plus() {
-                self.writer.write_bit(true);
-            }
+            // The proxy names the record's class; 499 is the proxy type
+            // code, not a class.
+            let class_id = i32::from(self.class_type_code(&value.dxf_name, 0));
+            self.write_proxy_fields(
+                common::OBJ_PROXY_OBJECT,
+                class_id,
+                &value.dxf_name,
+                0,
+                0,
+                true,
+            );
             self.write_registered_payload(&payload, &value.object_ids);
             self.register_object(value.handle);
             return;
@@ -565,20 +567,31 @@ impl<'a> DwgObjectWriter<'a> {
                 is_scale_independent,
                 is_snappable,
                 root_component,
+                undecoded_fields,
                 ..
             } => {
-                self.writer.write_variable_text(description);
                 self.writer.write_bit_long(*version);
                 self.writer.write_bit_long(*style_number);
-                self.writer.write_bytes(component_uid);
-                self.writer.write_bit(*is_continuous);
-                self.writer.write_bit_double(*unit_definition);
-                self.writer.write_bit_double(*unit_scale);
-                self.writer.write_bit_long(*units_type);
-                self.writer.write_bit(*is_element);
-                self.writer.write_bit(*is_physical);
-                self.writer.write_bit(*is_scale_independent);
-                self.writer.write_bit(*is_snappable);
+                if let Some(fields) = undecoded_fields {
+                    // The bits after the style number, as read. In R2004 and
+                    // older the name is among them.
+                    if self.version.r2007_plus() {
+                        self.writer.write_variable_text(description);
+                    }
+                    self.write_registered_payload(fields, &[]);
+                } else {
+                    self.writer.write_bit_double(*unit_scale);
+                    self.writer.write_bit_long(*units_type);
+                    self.writer.write_bit(*is_continuous);
+                    self.writer.write_bit_double(*unit_definition);
+                    self.writer.write_bit(*is_element);
+                    self.writer.write_bit(*is_physical);
+                    self.writer.write_bit(*is_scale_independent);
+                    self.writer.write_bit(*is_snappable);
+                    // In the string stream from R2007 on.
+                    self.writer.write_variable_text(description);
+                    self.writer.write_bytes(component_uid);
+                }
                 self.writer
                     .write_handle(DwgReferenceType::HardPointer, root_component.value());
             }
@@ -592,9 +605,10 @@ impl<'a> DwgObjectWriter<'a> {
                 component,
                 ..
             } => {
-                self.writer.write_variable_text(description);
                 self.writer.write_bit_long(*version);
                 self.writer.write_bit_long(kind.code());
+                // In the string stream from R2007 on.
+                self.writer.write_variable_text(description);
                 self.writer.write_bytes(component_uid);
                 self.writer.write_bit_double(*scale);
                 self.writer.write_bytes(&[*property_flags]);
@@ -674,7 +688,9 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(pattern.has_iteration_limit);
         self.writer.write_bit(pattern.is_single_segment);
         self.writer.write_bit_long(pattern.iteration_limit);
-        self.writer.write_bit_double(pattern.auto_phase);
+        // A BL in DWG (see the reader).
+        self.writer
+            .write_bit_long(pattern.auto_phase.round() as i32);
         self.writer.write_bit_double(pattern.phase);
         let phase_mode = pattern.phase_mode.code();
         self.writer.write_bit((phase_mode & 2) != 0);
@@ -722,6 +738,51 @@ impl<'a> DwgObjectWriter<'a> {
         }
     }
 
+    /// Writes the fields of a proxy record (ACAD_PROXY_ENTITY or
+    /// ACAD_PROXY_OBJECT, `record_type`) before its data (ODA specification
+    /// 20.4.90). From R2000: the class number (DXF 91), the R2004+ class name
+    /// (from the class table when `dxf_subclass` is empty), the data format
+    /// (DXF 95) and the origin bit (DXF 70). R13 and R14 store the record type
+    /// (DXF 90) and the class number only, as ODA does: it reads the second BL
+    /// as the class.
+    pub(super) fn write_proxy_fields(
+        &mut self,
+        record_type: i16,
+        class_id: i32,
+        dxf_subclass: &str,
+        dwg_version: i32,
+        maintenance_version: i32,
+        from_dxf: bool,
+    ) {
+        if !self.version.r2000_plus() {
+            self.writer.write_bit_long(i32::from(record_type));
+            self.writer.write_bit_long(class_id);
+            return;
+        }
+        self.writer.write_bit_long(class_id);
+        if self.dxf_version > crate::types::DxfVersion::AC1015 {
+            let dxf_subclass = if dxf_subclass.is_empty() {
+                self.document
+                    .classes
+                    .iter()
+                    .find(|class| i32::from(class.class_number) == class_id)
+                    .map(|class| class.dxf_name.as_str())
+                    .unwrap_or("")
+            } else {
+                dxf_subclass
+            };
+            self.writer.write_variable_text(dxf_subclass);
+        }
+        if self.version.r2018_plus(self.dxf_version) {
+            self.writer.write_bit_long(dwg_version);
+            self.writer.write_bit_long(maintenance_version);
+        } else {
+            self.writer
+                .write_bit_long((maintenance_version << 16) | (dwg_version & 0xffff));
+        }
+        self.writer.write_bit(from_dxf);
+    }
+
     fn write_proxy_object(&mut self, value: &ProxyObject) {
         self.write_common_non_entity_data(
             common::OBJ_PROXY_OBJECT,
@@ -730,30 +791,14 @@ impl<'a> DwgObjectWriter<'a> {
             &value.reactors,
             &value.xdictionary_handle,
         );
-        self.writer.write_bit_long(value.class_id);
-        if self.dxf_version > crate::types::DxfVersion::AC1015 {
-            let dxf_subclass = if value.dxf_subclass.is_empty() {
-                self.document
-                    .classes
-                    .iter()
-                    .find(|class| i32::from(class.class_number) == value.class_id)
-                    .map(|class| class.dxf_name.as_str())
-                    .unwrap_or("")
-            } else {
-                &value.dxf_subclass
-            };
-            self.writer.write_variable_text(dxf_subclass);
-        }
-        if self.version.r2018_plus(self.dxf_version) {
-            self.writer.write_bit_long(value.dwg_version);
-            self.writer.write_bit_long(value.maintenance_version);
-        } else {
-            self.writer
-                .write_bit_long((value.maintenance_version << 16) | (value.dwg_version & 0xffff));
-        }
-        if self.version.r2000_plus() {
-            self.writer.write_bit(value.from_dxf);
-        }
+        self.write_proxy_fields(
+            common::OBJ_PROXY_OBJECT,
+            value.class_id,
+            &value.dxf_subclass,
+            value.dwg_version,
+            value.maintenance_version,
+            value.from_dxf,
+        );
         let payload = value.payload.data();
         for bit_index in 0..value.payload.bit_count as usize {
             let byte = payload.get(bit_index / 8).copied().unwrap_or(0);
@@ -864,18 +909,31 @@ impl<'a> DwgObjectWriter<'a> {
         // A visual style filed in the pre-R2010 layout must say so: the
         // reader rejects the record unless it carries the ACAD
         // `AcDbSavedByObjectVersion` marker that announces the down-level
-        // object version.
+        // object version. The marker is a label and its value: it updates the
+        // pair already there, or goes in as one unit ahead of the style's own
+        // ACAD values, which are kept as they are.
         let extra: Vec<(u64, Vec<u8>)> = if self.version.r2010_plus() {
             Vec::new()
         } else {
-            let mut marker = crate::xdata::ExtendedDataRecord::new("ACAD");
-            marker.add_value(crate::xdata::XDataValue::String(
-                "AcDbSavedByObjectVersion".to_string(),
-            ));
-            marker.add_value(crate::xdata::XDataValue::Integer16(0));
-            self.encode_xdata_record(&marker).into_iter().collect()
+            use crate::xdata::XDataValue;
+            let mut acad = crate::xdata::ExtendedDataRecord::new("ACAD");
+            acad.values = self
+                .existing_xdata_values(value.handle, "ACAD")
+                .unwrap_or_default();
+            let label = XDataValue::String("AcDbSavedByObjectVersion".to_string());
+            match acad.values.iter().position(|value| *value == label) {
+                Some(index)
+                    if matches!(acad.values.get(index + 1), Some(XDataValue::Integer16(_))) =>
+                {
+                    acad.values[index + 1] = XDataValue::Integer16(0);
+                }
+                _ => {
+                    acad.values.splice(0..0, [label, XDataValue::Integer16(0)]);
+                }
+            }
+            self.encode_xdata_record(&acad).into_iter().collect()
         };
-        self.write_common_non_entity_data_eed(
+        self.write_common_non_entity_data_replacing_eed(
             type_code,
             value.handle,
             value.owner,
@@ -1142,6 +1200,26 @@ impl<'a> DwgObjectWriter<'a> {
         }
     }
 
+    fn write_table_template_object(&mut self, value: &crate::entities::Table) {
+        let Some(type_code) = self
+            .document
+            .classes
+            .get_by_name("TABLETEMPLATE")
+            .map(|class| class.class_number)
+        else {
+            return;
+        };
+        self.write_common_non_entity_data(
+            type_code,
+            value.common.handle,
+            value.common.owner_handle,
+            &value.common.reactors,
+            &value.common.xdictionary_handle,
+        );
+        self.write_table_content(value);
+        self.register_object(value.common.handle);
+    }
+
     fn write_table_content_object(&mut self, value: &crate::entities::Table) {
         let type_code = self.class_type_code("TABLECONTENT", common::OBJ_TABLECONTENT);
         self.write_common_non_entity_data(
@@ -1167,7 +1245,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_common_non_entity_data(type_code, value.handle, value.owner_handle, &[], &None);
 
         if !self.version.r2010_plus() {
-            self.writer.write_variable_text(&value.name);
+            self.writer.write_variable_text(&value.description);
             self.writer.write_bit_short(value.flow_direction as i16);
             self.writer
                 .write_bit_short(value.effective_flags().bits() & !STALE_TABLE_STYLE_FLAG);
@@ -1180,7 +1258,7 @@ impl<'a> DwgObjectWriter<'a> {
             self.write_legacy_table_row_style(&value.header_row_style);
         } else {
             self.writer.write_byte(value.modern_unknown_byte);
-            self.writer.write_variable_text(&value.name);
+            self.writer.write_variable_text(&value.description);
             // The R2010+ flags field carries the table style flags.
             self.writer
                 .write_bit_long((value.effective_flags().bits() & !STALE_TABLE_STYLE_FLAG) as i32);
@@ -1189,16 +1267,24 @@ impl<'a> DwgObjectWriter<'a> {
                 DwgReferenceType::HardOwnership,
                 value.modern_cell_style_handle.value(),
             );
+            // The base "Table" cell style carries the table direction.
+            let flow_up = value.flow_direction == crate::objects::TableFlowDirection::Up;
             if let Some(style) = &value.modern_style {
+                let mut style = style.clone();
+                if flow_up {
+                    style.cell_style.merge_flags |= TableCellStyleData::FLOW_UP;
+                } else {
+                    style.cell_style.merge_flags &= !TableCellStyleData::FLOW_UP;
+                }
                 // The base "Table" style normally has no text style and keeps
                 // none; only a dangling one is resolved.
                 if style.cell_style.content_format.text_style.is_null() {
-                    self.write_named_table_cell_style(style);
+                    self.write_named_table_cell_style(&style);
                 } else {
-                    self.write_table_style_named_cell_style(style);
+                    self.write_table_style_named_cell_style(&style);
                 }
             } else {
-                self.write_default_modern_table_cell_style(value);
+                self.write_default_modern_table_cell_style(value, flow_up);
             }
             if value.modern_overrides.is_empty() {
                 self.write_default_modern_table_row_styles(value);
@@ -1216,13 +1302,11 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_legacy_table_row_style(&mut self, value: &RowCellStyle) {
-        self.writer.write_handle(
-            DwgReferenceType::HardPointer,
-            value
-                .text_style_handle
-                .map(|handle| handle.value())
-                .unwrap_or(0),
-        );
+        // A row read from DXF only has the text style name: resolve it as
+        // the R2010+ cell styles do, never write a null text style.
+        let text_style = self.resolve_table_row_text_style(value);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, text_style.value());
         self.writer.write_bit_double(value.text_height);
         self.writer.write_bit_short(value.alignment as i16);
         self.writer.write_cm_true_color(&value.text_color);
@@ -1323,10 +1407,11 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_named_table_cell_style(&value);
     }
 
-    fn write_default_modern_table_cell_style(&mut self, value: &TableStyle) {
+    fn write_default_modern_table_cell_style(&mut self, value: &TableStyle, flow_up: bool) {
         let cell_style = TableCellStyleData {
             style_type: 5,
             data_flags: 1,
+            merge_flags: if flow_up { TableCellStyleData::FLOW_UP } else { 0 },
             background_color: Color::None,
             content_layout: 1,
             content_format: TableContentFormat {
@@ -1366,64 +1451,27 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_long(rows.len() as i32);
         for (key, row, id, style_type, name, merge_flags) in rows {
             self.writer.write_bit_long(key);
-            self.write_default_modern_table_row_style(row, id, style_type, name, merge_flags);
+            self.write_default_modern_table_row_style(
+                row,
+                (id, style_type, name, merge_flags),
+                (
+                    value.horizontal_margin,
+                    value.vertical_margin,
+                    value.data_row_style.text_height,
+                ),
+            );
         }
     }
 
     fn write_default_modern_table_row_style(
         &mut self,
         row: &RowCellStyle,
-        id: i32,
-        style_type: i32,
-        name: &str,
-        merge_flags: i32,
+        (id, style_type, name, merge_flags): (i32, i32, &str, i32),
+        margins: (f64, f64, f64),
     ) {
-        // R2010+ edge order; the grid flag is set for a hidden edge, the
-        // reverse of the row border's `is_invisible`.
-        let borders = [
-            (1, &row.top_border),
-            (2, &row.horizontal_inside_border),
-            (4, &row.bottom_border),
-            (8, &row.left_border),
-            (16, &row.vertical_inside_border),
-            (32, &row.right_border),
-        ]
-        .into_iter()
-        .map(|(index_mask, border)| TableGridFormat {
-            index_mask,
-            border: TableCellBorder {
-                is_invisible: !border.is_invisible,
-                ..border.clone()
-            },
-            line_type: Handle::NULL,
-        })
-        .collect();
-
+        let text_style = self.resolve_table_row_text_style(row);
         self.write_named_table_cell_style(&NamedTableCellStyle {
-            cell_style: TableCellStyleData {
-                style_type: 5,
-                data_flags: 1,
-                merge_flags,
-                background_color: if row.fill_enabled {
-                    row.fill_color
-                } else {
-                    Color::None
-                },
-                content_layout: 1,
-                content_format: TableContentFormat {
-                    value_data_type: row.data_type,
-                    value_unit_type: row.unit_type,
-                    value_format_string: row.format_string.clone(),
-                    block_scale: 1.0,
-                    cell_alignment: row.alignment as i32,
-                    content_color: row.text_color,
-                    text_style: self.resolve_table_row_text_style(row),
-                    text_height: row.text_height,
-                    ..TableContentFormat::default()
-                },
-                borders,
-                ..TableCellStyleData::default()
-            },
+            cell_style: crate::objects::row_cell_style(row, margins, text_style, merge_flags),
             id,
             style_type,
             name: name.to_string(),
@@ -2081,10 +2129,13 @@ impl<'a> DwgObjectWriter<'a> {
                     .write_handle(DwgReferenceType::HardPointer, lt_handle.value());
             } else {
                 // Before R2018: bit_short index into the linetypes in table
-                // order, EXCLUDING ByBlock/ByLayer; 0x7FFF means ByLayer.
+                // order, EXCLUDING ByBlock/ByLayer; 0x7FFF means ByLayer,
+                // 0x7FFE ByBlock.
                 let idx: i16 =
                     if elem.linetype.is_empty() || elem.linetype.eq_ignore_ascii_case("ByLayer") {
                         0x7FFF
+                    } else if elem.linetype.eq_ignore_ascii_case("ByBlock") {
+                        0x7FFE
                     } else {
                         self.document
                             .line_types
@@ -2216,7 +2267,13 @@ impl<'a> DwgObjectWriter<'a> {
     fn write_image_definition(&mut self, def: &ImageDefinition) {
         // UNLISTED type — always use DXF class number (500+)
         let type_code = self.class_type_code("IMAGEDEF", common::OBJ_IMAGEDEF);
-        let reactors = self.document.image_definition_reactors(def);
+        // The definition's own list when the document keeps one, else the
+        // reactors derived from the drawing.
+        let reactors = if def.reactors.is_empty() {
+            self.document.image_definition_reactors(def)
+        } else {
+            def.reactors.clone()
+        };
         self.write_common_non_entity_data(type_code, def.handle, def.owner, &reactors, &None);
 
         self.writer.write_bit_long(def.class_version);
@@ -2335,15 +2392,11 @@ impl<'a> DwgObjectWriter<'a> {
         );
 
         // AcDbObjectContextData base. AutoCAD writes class version and the
-        // default flag only. The R2010 file-to-extension-dictionary bit from
-        // ODA §20.4.89 is stored solely for an MLeader context that was read
-        // from that ODA layout (`uses_legacy_mleader_context_base` is false).
+        // default flag only, for every class. It does not open a drawing
+        // whose MLeader context carries the R2010 file-to-extension-dictionary
+        // bit from ODA §20.4.89, so a context read from that layout is written
+        // in the native one as well.
         self.writer.write_bit_short(obj.class_version);
-        let oda_mleader_base = matches!(obj.kind, ObjectContextKind::MLeader(_))
-            && !obj.uses_legacy_mleader_context_base;
-        if self.version.r2010_plus() && oda_mleader_base {
-            self.writer.write_bit(obj.has_file_to_extension_dictionary);
-        }
         self.writer.write_bit(obj.is_default);
 
         // AcDbAnnotScaleObjectContextData: first object-specific handle.
@@ -2550,7 +2603,7 @@ impl<'a> DwgObjectWriter<'a> {
         }
         if let ObjectContextKind::HatchView(value) = &obj.kind {
             self.writer
-                .write_handle(DwgReferenceType::SoftOwnership, value.view.value());
+                .write_handle(DwgReferenceType::SoftPointer, value.view.value());
         }
         if let ObjectContextKind::MTextAttribute(value) = &obj.kind {
             if value.enable_context {
@@ -3027,5 +3080,292 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_short(wv.display_frame);
 
         self.register_object(wv.handle);
+    }
+}
+
+#[cfg(test)]
+mod annotation_reference_tests {
+    use super::*;
+    use crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader;
+    use crate::objects::{HatchScaleContext, HatchViewContext};
+    use crate::types::{DxfVersion, Vector3};
+    use crate::CadDocument;
+
+    #[test]
+    fn hatch_view_target_is_a_soft_pointer_including_null() {
+        // Native 2527 source: all 84 HatchView target references use code 4,
+        // including 77 nulls. A view context references, rather than owns,
+        // its Paper viewport. Checking only the resolved handle misses this.
+        for target in [0, 0x1003] {
+            let mut document = CadDocument::new();
+            document.version = DxfVersion::AC1032;
+            document.register_object_context_class("ACDB_HATCHVIEWCONTEXTDATA_CLASS");
+            let context = ObjectContextData {
+                handle: Handle::from(0x1000u64),
+                owner_handle: Handle::from(0x1001u64),
+                reactors: vec![Handle::from(0x1001u64)],
+                xdictionary_handle: None,
+                class_version: 4,
+                has_file_to_extension_dictionary: true,
+                uses_legacy_mleader_context_base: false,
+                is_default: true,
+                scale: Handle::from(0x1002u64),
+                kind: ObjectContextKind::HatchView(HatchViewContext {
+                    hatch: HatchScaleContext {
+                        pattern_lines: vec![],
+                        pattern_scale: 1.0,
+                        pattern_base: Vector3::ZERO,
+                        loops: vec![],
+                    },
+                    view: Handle::from(target),
+                    view_normal: Vector3::UNIT_Z,
+                    view_rotation: 0.0,
+                    evaluate_hatch: false,
+                }),
+            };
+            let mut writer = DwgObjectWriter::new(&document).expect("writer");
+            writer.write_object_context_data(&context);
+            let offset = writer.handle_map()[0].1 as usize;
+            let reader = DwgObjectReader::new(
+                writer.output().to_vec(),
+                document.version,
+                Default::default(),
+            )
+            .expect("object reader");
+            let (kind, mut record) = reader.read_record_at(offset).expect("record");
+            let common = reader.read_common_non_entity_data(&mut record, kind);
+            assert_eq!(common.owner_handle, context.owner_handle.value());
+            assert_eq!(record.read_handle(), context.scale.value());
+            let (actual_target, reference_type) =
+                record.read_handle_reference(context.handle.value());
+            assert_eq!(actual_target, target);
+            assert_eq!(reference_type, DwgReferenceType::SoftPointer);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dgn_line_style_tests {
+    //! AcDbLS* records in the order the file stores them (#372): the UID of a
+    //! definition is last, and in R2004 and older the name follows the flags
+    //! of a definition and the type of a component.
+
+    use super::*;
+    use crate::io::dwg::dwg_stream_readers::merged_reader::DwgMergedReader;
+    use crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader;
+    use crate::CadDocument;
+
+    const UID: [u8; 16] = [
+        0x5a, 0x31, 0x0c, 0x77, 0x9e, 0x42, 0x4b, 0x18, 0x8d, 0x06, 0x63, 0xf1, 0x27, 0xb4, 0x90,
+        0x3e,
+    ];
+    const VERSIONS: [DxfVersion; 4] = [
+        DxfVersion::AC1015,
+        DxfVersion::AC1018,
+        DxfVersion::AC1024,
+        DxfVersion::AC1032,
+    ];
+
+    fn line_style(data: DgnLineStyleData) -> DgnLineStyleObject {
+        DgnLineStyleObject {
+            handle: Handle::from(0x1000u64),
+            owner: Handle::from(0x0cu64),
+            reactors: Vec::new(),
+            xdictionary_handle: None,
+            data,
+        }
+    }
+
+    fn definition(undecoded_fields: Option<ProxyPayload>) -> DgnLineStyleData {
+        DgnLineStyleData::Definition {
+            description: "{ Synthetic Line }".to_string(),
+            version: 1,
+            style_number: 7,
+            component_uid: UID,
+            is_continuous: true,
+            unit_definition: 1.0,
+            unit_scale: 0.25,
+            units_type: 3,
+            is_element: false,
+            is_physical: true,
+            is_scale_independent: false,
+            is_snappable: true,
+            root_component: Handle::from(0x2au64),
+            undecoded_fields,
+            properties: Vec::new(),
+        }
+    }
+
+    /// Writes `object` in `version` and returns a reader at its body.
+    fn written_body(version: DxfVersion, object: &DgnLineStyleObject) -> DwgMergedReader {
+        let document = CadDocument::with_version(version);
+        let mut writer = DwgObjectWriter::new(&document).expect("writer");
+        writer.write_dgn_line_style_object(object);
+        let offset = writer.handle_map()[0].1 as usize;
+        let reader = DwgObjectReader::new(writer.output().to_vec(), version, Default::default())
+            .expect("object reader");
+        let (kind, mut record) = reader.read_record_at(offset).expect("record");
+        let common = reader.read_common_non_entity_data(&mut record, kind);
+        assert_eq!(common.owner_handle, object.owner.value(), "{version:?}");
+        record
+    }
+
+    #[test]
+    fn a_definition_is_written_in_the_file_layout() {
+        for version in VERSIONS {
+            let mut r = written_body(version, &line_style(definition(None)));
+            assert_eq!(r.read_bit_long(), 1, "{version:?}: version");
+            assert_eq!(r.read_bit_long(), 7, "{version:?}: style number");
+            assert_eq!(r.read_bit_double(), 0.25, "{version:?}: unit scale");
+            assert_eq!(r.read_bit_long(), 3, "{version:?}: units type");
+            assert!(r.read_bit(), "{version:?}: is continuous");
+            assert_eq!(r.read_bit_double(), 1.0, "{version:?}: unit definition");
+            assert_eq!(
+                [r.read_bit(), r.read_bit(), r.read_bit(), r.read_bit()],
+                [false, true, false, true],
+                "{version:?}: flags"
+            );
+            assert_eq!(r.read_variable_text(), "{ Synthetic Line }", "{version:?}");
+            assert_eq!(r.read_bytes(16), UID, "{version:?}: UID");
+            r.check_error().unwrap();
+            assert_eq!(r.main_remaining_bits(), 0, "{version:?}: data left over");
+            assert_eq!(r.read_handle(), 0x2a, "{version:?}: root component");
+        }
+    }
+
+    #[test]
+    fn undecoded_definition_fields_follow_the_style_number() {
+        // The bits after the style number, kept as read; in R2004 and older
+        // the name is among them.
+        let payload = ProxyPayload::from_bits(&[0b1011_0000], 4);
+        for version in VERSIONS {
+            let mut r = written_body(version, &line_style(definition(Some(payload.clone()))));
+            assert_eq!(r.read_bit_long(), 1, "{version:?}: version");
+            assert_eq!(r.read_bit_long(), 7, "{version:?}: style number");
+            assert_eq!(
+                [r.read_bit(), r.read_bit(), r.read_bit(), r.read_bit()],
+                [true, false, true, true],
+                "{version:?}: kept bits"
+            );
+            r.check_error().unwrap();
+            assert_eq!(r.main_remaining_bits(), 0, "{version:?}: data left over");
+            if version >= DxfVersion::AC1021 {
+                assert_eq!(r.read_variable_text(), "{ Synthetic Line }", "{version:?}");
+            }
+            assert_eq!(r.read_handle(), 0x2a, "{version:?}: root component");
+        }
+    }
+
+    #[test]
+    fn a_component_is_written_with_its_name_after_its_type() {
+        let component = line_style(DgnLineStyleData::Component {
+            kind: DgnLsComponentType::Symbol,
+            description: "Rail - Symbol".to_string(),
+            version: 1,
+            component_uid: UID,
+            scale: 2.0,
+            property_flags: 3,
+            component: DgnLsComponentData::Symbol(DgnLsSymbolComponent {
+                stored_unit_scale: 0.5,
+                unit_scale: 4.0,
+                has_unit_scale: true,
+                is_3d: false,
+                block: Handle::from(0x4cu64),
+            }),
+            properties: Vec::new(),
+        });
+        for version in VERSIONS {
+            let mut r = written_body(version, &component);
+            assert_eq!(r.read_bit_long(), 1, "{version:?}: version");
+            assert_eq!(r.read_bit_long(), 1, "{version:?}: component type");
+            assert_eq!(r.read_variable_text(), "Rail - Symbol", "{version:?}");
+            assert_eq!(r.read_bytes(16), UID, "{version:?}: UID");
+            assert_eq!(r.read_bit_double(), 2.0, "{version:?}: scale");
+            assert_eq!(r.read_bytes(1), [3], "{version:?}: flags");
+            assert_eq!(r.read_bit_double(), 0.5, "{version:?}: stored unit scale");
+            assert_eq!(r.read_bit_double(), 4.0, "{version:?}: unit scale");
+            assert_eq!([r.read_bit(), r.read_bit()], [true, false], "{version:?}");
+            r.check_error().unwrap();
+            assert_eq!(r.main_remaining_bits(), 0, "{version:?}: data left over");
+            assert_eq!(r.read_handle(), 0x4c, "{version:?}: block");
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_object_layout_tests {
+    //! ACAD_PROXY_OBJECT fields before the data, as for the proxy entity
+    //! (ODA specification 20.4.90): R13 and R14 hold the type (DXF 90, 499)
+    //! and the class number, R2000 the class number, the data format and the
+    //! origin bit.
+
+    use super::*;
+    use crate::io::dwg::dwg_stream_readers::merged_reader::DwgMergedReader;
+    use crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader;
+    use crate::objects::{ProxyObject, ProxyPayload};
+    use crate::CadDocument;
+
+    const CLASS: i32 = 511;
+    const DATA: [u8; 3] = [0x3C, 0xC3, 0x99];
+
+    /// Writes a proxy object in `version` and returns a reader after its
+    /// common object data.
+    fn written_body(version: DxfVersion) -> DwgMergedReader {
+        let doc = CadDocument::with_version(version);
+        let object = ProxyObject {
+            handle: Handle::new(0x7000),
+            owner: doc.header.named_objects_dict_handle,
+            proxy_id: 499,
+            class_id: CLASS,
+            version: 0x15,
+            dwg_version: 0x15,
+            payload: ProxyPayload::from_bytes(&DATA),
+            ..Default::default()
+        };
+        let mut writer = DwgObjectWriter::new(&doc).unwrap();
+        writer.write_proxy_object(&object);
+        let offset = writer.handle_map()[0].1 as usize;
+        let reader =
+            DwgObjectReader::new(writer.output().to_vec(), version, Default::default()).unwrap();
+        let (kind, mut record) = reader.read_record_at(offset).unwrap();
+        assert_eq!(kind, common::OBJ_PROXY_OBJECT, "{version:?}");
+        reader.read_common_non_entity_data(&mut record, kind);
+        record
+    }
+
+    fn assert_data(record: &mut DwgMergedReader, version: DxfVersion) {
+        let mut data = [0u8; 3];
+        for bit in 0..24 {
+            if record.read_bit() {
+                data[bit / 8] |= 0x80 >> (bit % 8);
+            }
+        }
+        record.check_error().unwrap();
+        assert_eq!(data, DATA, "{version:?}: data");
+        assert_eq!(
+            record.main_remaining_bits(),
+            0,
+            "{version:?}: bits left over"
+        );
+    }
+
+    #[test]
+    fn r13_and_r14_proxy_object_holds_its_type_and_class_before_the_data() {
+        for version in [DxfVersion::AC1012, DxfVersion::AC1014] {
+            let mut record = written_body(version);
+            assert_eq!(record.read_bit_long(), 499, "{version:?}: DXF 90");
+            assert_eq!(record.read_bit_long(), CLASS, "{version:?}: class number");
+            assert_data(&mut record, version);
+        }
+    }
+
+    #[test]
+    fn r2000_proxy_object_holds_its_class_format_and_origin_before_the_data() {
+        let version = DxfVersion::AC1015;
+        let mut record = written_body(version);
+        assert_eq!(record.read_bit_long(), CLASS, "class number");
+        assert_eq!(record.read_bit_long(), 0x15, "data format");
+        assert!(!record.read_bit(), "origin");
+        assert_data(&mut record, version);
     }
 }

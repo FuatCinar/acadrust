@@ -171,10 +171,13 @@ impl MTextParagraphAlignment {
             'c' => MTextParagraphAlignment::Center,
             'j' => MTextParagraphAlignment::Justified,
             'd' => MTextParagraphAlignment::Distributed,
-            // ACAD serializes the paragraph *Justify* option as `\pq*` (the
-            // `*` that means "reset" in the other sub-codes), so a `q*` reads as
-            // justified rather than an alignment reset.
-            '*' => MTextParagraphAlignment::Justified,
+            // `\pq*` is the alignment *reset*: like the other sub-codes, `*`
+            // means "go back to the default", so the paragraph inherits the
+            // entity's attachment alignment. Civil 3D and survey exporters
+            // write it to cancel a preceding `\pqc;` or `\pqr;` block, and
+            // those labels stay centred in AutoCAD. Reading it as Justified
+            // instead left every following single-line paragraph ragged-left.
+            '*' => MTextParagraphAlignment::Default,
             _ => MTextParagraphAlignment::Default,
         }
     }
@@ -223,6 +226,9 @@ pub enum StackingType {
     Diagonal = 1,
     /// Stacked limit (no line): `\S<num>^<den>;`
     Limit = 2,
+    /// Decimal stack, the halves lined up on their decimal points:
+    /// `\S<num>~.<den>;` (the character after `~` is the decimal point).
+    Decimal = 3,
 }
 
 impl StackingType {
@@ -232,6 +238,7 @@ impl StackingType {
             '/' => StackingType::Horizontal,
             '#' => StackingType::Diagonal,
             '^' => StackingType::Limit,
+            '~' => StackingType::Decimal,
             _ => StackingType::Horizontal,
         }
     }
@@ -258,7 +265,9 @@ impl StackingData {
         match self.stacking_type {
             StackingType::Horizontal => format!("{}/{}", self.numerator, self.denominator),
             StackingType::Diagonal => format!("{}/{}", self.numerator, self.denominator),
-            StackingType::Limit => format!("{} {}", self.numerator, self.denominator),
+            StackingType::Limit | StackingType::Decimal => {
+                format!("{} {}", self.numerator, self.denominator)
+            }
         }
     }
 }
@@ -279,28 +288,82 @@ pub struct ParagraphProperties {
     pub left_margin: Option<f64>,
     /// Right margin from `r<n>`.
     pub right_margin: Option<f64>,
-    /// Spacing before paragraph from `b<n>` (inches).
+    /// Spacing before paragraph from `b<n>`, as a multiple of the entity's
+    /// text height (`b2` leaves two text heights). See
+    /// [`spacing_before_distance`](Self::spacing_before_distance).
     pub spacing_before: Option<f64>,
-    /// Spacing after paragraph from `a<n>` (inches).
+    /// Spacing after paragraph from `a<n>`, as a multiple of the entity's
+    /// text height. See [`spacing_after_distance`](Self::spacing_after_distance).
     pub spacing_after: Option<f64>,
-    /// Line spacing from `se<n>` (exact spacing in inches) or `sm<n>` (multiple of font height).
+    /// Line spacing from `se<n>` or `sm<n>`. Both are factors of the default
+    /// line pitch, not distances. See [`MTextLineSpacing`].
     pub line_spacing: Option<MTextLineSpacing>,
     /// Tab stops from `t<n>` (comma-separated, each optionally prefixed by
     /// `c`/`r`/`D` for center/right/decimal alignment).
     pub tab_stops: Vec<TabStop>,
 }
 
-/// Line spacing mode from `se` (exact) or `sm` (multiple) inside `\p...;`.
+impl ParagraphProperties {
+    /// Space before the paragraph in drawing units: `b<n>` × `text_height`.
+    /// `None` when the paragraph has no `b` code.
+    pub fn spacing_before_distance(&self, text_height: f64) -> Option<f64> {
+        self.spacing_before.map(|factor| factor * text_height)
+    }
+
+    /// Space after the paragraph in drawing units: `a<n>` × `text_height`.
+    /// `None` when the paragraph has no `a` code.
+    pub fn spacing_after_distance(&self, text_height: f64) -> Option<f64> {
+        self.spacing_after.map(|factor| factor * text_height)
+    }
+}
+
+/// Line spacing mode from `se` (exact), `sa` (at least) or `sm` (multiple)
+/// inside `\p...;`.
+///
+/// None of the values is a distance. All are factors of the default line pitch,
+/// [`DEFAULT_PITCH_FACTOR`](Self::DEFAULT_PITCH_FACTOR) × text height. They
+/// differ in where a line's baseline sits in its slot (see
+/// [`baseline_offset`](Self::baseline_offset)).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MTextLineSpacing {
-    /// Default (automatic line spacing).
+    /// Default (the entity's line spacing factor, DXF 44).
     #[default]
     Default,
-    /// Exact spacing in inches: `se<n>`.
+    /// Exact spacing factor `se<n>`: pitch `n` × 5/3 × text height, with the
+    /// baseline `n` × text height below the top of the line slot.
     Exact(f64),
-    /// Multiple of font height: `sm<n>`.
+    /// Multiple spacing factor `sm<n>`: pitch `n` × 5/3 × text height.
     Multiple(f64),
+    /// At-least spacing factor `sa<n>`: pitch `n` × 5/3 × text height, or
+    /// more where a line holds taller text.
+    AtLeast(f64),
+}
+
+impl MTextLineSpacing {
+    /// Default baseline-to-baseline pitch as a multiple of the text height.
+    pub const DEFAULT_PITCH_FACTOR: f64 = 5.0 / 3.0;
+
+    /// Baseline-to-baseline distance in drawing units. `entity_factor` is the
+    /// entity's line spacing factor (DXF 44), used for [`Default`](Self::Default).
+    pub fn line_pitch(&self, text_height: f64, entity_factor: f64) -> f64 {
+        let factor = match *self {
+            Self::Default => entity_factor,
+            Self::Exact(factor) | Self::Multiple(factor) | Self::AtLeast(factor) => factor,
+        };
+        factor * Self::DEFAULT_PITCH_FACTOR * text_height
+    }
+
+    /// Distance in drawing units from the top of a line's slot down to its
+    /// baseline. This is `n` × text height for `se<n>` and one text height
+    /// otherwise, so `se2` drops the first line by one text height and `se0.5`
+    /// raises it by half.
+    pub fn baseline_offset(&self, text_height: f64) -> f64 {
+        match *self {
+            Self::Exact(factor) => factor * text_height,
+            Self::Default | Self::Multiple(_) | Self::AtLeast(_) => text_height,
+        }
+    }
 }
 
 // ============================================================================
@@ -854,9 +917,7 @@ pub struct MTextDocument {
 /// Returns `true` if the paragraph properties contain any non-default values
 /// that should be serialized into `\p...;` format.
 fn para_has_props(p: &ParagraphProperties) -> bool {
-    p.alignment
-        .as_ref()
-        .map_or(false, |a| !matches!(a, MTextParagraphAlignment::Default))
+    p.alignment.is_some()
         || p.first_line_indent.is_some()
         || p.left_margin.is_some()
         || p.right_margin.is_some()
@@ -962,7 +1023,8 @@ impl MTextDocument {
                         MTextParagraphAlignment::Center => result.push_str("qc"),
                         MTextParagraphAlignment::Justified => result.push_str("qj"),
                         MTextParagraphAlignment::Distributed => result.push_str("qd"),
-                        MTextParagraphAlignment::Default => {}
+                        // The reset back to the attachment alignment.
+                        MTextParagraphAlignment::Default => result.push_str("q*"),
                     }
                 }
                 if let Some(v) = para_props.first_line_indent {
@@ -988,6 +1050,9 @@ impl MTextDocument {
                         }
                         MTextLineSpacing::Multiple(v) => {
                             write!(result, ",sm{}", v).ok();
+                        }
+                        MTextLineSpacing::AtLeast(v) => {
+                            write!(result, ",sa{}", v).ok();
                         }
                     }
                 }
@@ -1021,9 +1086,10 @@ impl MTextDocument {
 
                 if let Some(ref stack) = span.stacking {
                     let sep = match stack.stacking_type {
-                        StackingType::Horizontal => '/',
-                        StackingType::Diagonal => '#',
-                        StackingType::Limit => '^',
+                        StackingType::Horizontal => "/",
+                        StackingType::Diagonal => "#",
+                        StackingType::Limit => "^",
+                        StackingType::Decimal => "~.",
                     };
                     write!(
                         result,

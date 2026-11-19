@@ -1,7 +1,7 @@
 //! Hatch entity and boundary path types
 
 use crate::entities::{Entity, EntityCommon};
-use crate::types::{BoundingBox3D, Color, Handle, Transform, Vector2, Vector3};
+use crate::types::{rotate_point_2d, BoundingBox3D, Color, Handle, Transform, Vector2, Vector3};
 
 /// Hatch pattern type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +76,21 @@ impl BoundaryPathFlags {
         self.bits & 16 != 0
     }
 
+    /// AutoCAD adds a synthetic "textbox" boundary path (used only to keep
+    /// hatch pattern lines clear of associated text) around text objects
+    /// that participate in the hatch's associativity. It is not part of the
+    /// fill geometry and must never be tessellated/filled.
+    pub fn is_textbox(&self) -> bool {
+        self.bits & 8 != 0
+    }
+
+    /// A path AutoCAD flagged as an exact duplicate of another boundary
+    /// path. Keeping both copies in even-odd nesting analysis double-counts
+    /// the region and corrupts hole detection, so duplicates are dropped.
+    pub fn is_duplicate(&self) -> bool {
+        self.bits & 256 != 0
+    }
+
     pub fn is_not_closed(&self) -> bool {
         self.bits & 32 != 0
     }
@@ -140,9 +155,11 @@ pub struct CircularArcEdge {
     pub center: Vector2,
     /// Radius
     pub radius: f64,
-    /// Start angle in radians
+    /// Start angle in radians. A clockwise edge runs clockwise from
+    /// `-start_angle` to `-end_angle`, so the clockwise arc from 90° to 270°
+    /// is stored as 270° and 90°.
     pub start_angle: f64,
-    /// End angle in radians
+    /// End angle in radians. See [`Self::start_angle`].
     pub end_angle: f64,
     /// Counter-clockwise flag
     pub counter_clockwise: bool,
@@ -376,11 +393,15 @@ impl HatchPattern {
         self.lines.push(line);
     }
 
-    /// Update pattern with scale and rotation
-    pub fn update(&mut self, _base_point: Vector2, angle: f64, scale: f64) {
+    /// Rotate the pattern lines by `angle` and scale them by `scale` about
+    /// `base_point`: base points, offsets and dashes, the way DWG and DXF
+    /// store the definition lines of a HATCH.
+    pub fn update(&mut self, base_point: Vector2, angle: f64, scale: f64) {
         for line in &mut self.lines {
             line.angle += angle;
-            line.offset = line.offset * scale;
+            line.base_point = base_point
+                + (rotate_point_2d(line.base_point, base_point, angle) - base_point) * scale;
+            line.offset = rotate_point_2d(line.offset, Vector2::ZERO, angle) * scale;
             for dash in &mut line.dash_lengths {
                 *dash *= scale;
             }
@@ -507,6 +528,12 @@ pub struct Hatch {
 }
 
 impl Hatch {
+    /// The filled area: each boundary loop's exact area, islands taken out
+    /// as the hatch style says. `None` without a closed loop.
+    pub fn area(&self) -> Option<f64> {
+        crate::entities::modification::explode::hatch_area(self)
+    }
+
     /// Create a new hatch entity
     pub fn new() -> Self {
         Self {
@@ -550,17 +577,13 @@ impl Hatch {
 
     /// Builder: Set the pattern angle
     pub fn with_pattern_angle(mut self, angle: f64) -> Self {
-        self.pattern_angle = angle;
-        self.pattern
-            .update(Vector2::new(0.0, 0.0), angle, self.pattern_scale);
+        self.set_pattern_angle(angle);
         self
     }
 
     /// Builder: Set the pattern scale
     pub fn with_pattern_scale(mut self, scale: f64) -> Self {
-        self.pattern_scale = scale;
-        self.pattern
-            .update(Vector2::new(0.0, 0.0), self.pattern_angle, scale);
+        self.set_pattern_scale(scale);
         self
     }
 
@@ -586,18 +609,24 @@ impl Hatch {
         self.seed_points.push(point);
     }
 
-    /// Set the pattern angle (updates pattern)
+    /// Set the pattern angle and rotate the pattern lines by the change,
+    /// keeping them stored transformed as in DWG and DXF.
     pub fn set_pattern_angle(&mut self, angle: f64) {
-        self.pattern_angle = angle;
         self.pattern
-            .update(Vector2::new(0.0, 0.0), angle, self.pattern_scale);
+            .update(Vector2::ZERO, angle - self.pattern_angle, 1.0);
+        self.pattern_angle = angle;
     }
 
-    /// Set the pattern scale (updates pattern)
+    /// Set the pattern scale and scale the pattern lines by the change,
+    /// keeping them stored transformed as in DWG and DXF.
     pub fn set_pattern_scale(&mut self, scale: f64) {
+        let ratio = if self.pattern_scale.abs() > f64::EPSILON {
+            scale / self.pattern_scale
+        } else {
+            scale
+        };
+        self.pattern.update(Vector2::ZERO, 0.0, ratio);
         self.pattern_scale = scale;
-        self.pattern
-            .update(Vector2::new(0.0, 0.0), self.pattern_angle, scale);
     }
 
     /// Get the number of boundary paths
@@ -713,3 +742,8 @@ impl Entity for Hatch {
         super::mirror::mirror_hatch_with_options(self, transform, options);
     }
 }
+
+// The census cannot destructure these private flag bits outside this module.
+const _: fn(&BoundaryPathFlags) = |v| {
+    let BoundaryPathFlags { bits: _ } = v;
+};

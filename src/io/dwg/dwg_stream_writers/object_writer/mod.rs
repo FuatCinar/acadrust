@@ -57,7 +57,8 @@ pub(crate) fn paper_space_block_handle(document: &CadDocument) -> Handle {
 }
 
 /// Reserve the bare paper-space name for the active record without colliding
-/// with other layouts. Anonymous names retain their native ordinal encoding.
+/// with other layouts. An anonymous name is stored bare (`*U`), as AutoCAD
+/// stores it in the BLOCK_HEADER; the BLOCK marker keeps the number.
 fn dwg_block_name<'a>(
     document: &'a CadDocument,
     record: &'a BlockRecord,
@@ -151,6 +152,9 @@ pub struct DwgObjectWriter<'a> {
     /// Populated before writing any table controls so controls and records agree.
     #[allow(dead_code)]
     pub(super) linetype_handles: std::collections::HashMap<String, Handle>,
+    /// Layer handle written for each entity layer name, as spelled on the
+    /// entity; filled by `entity_layer_handle` on first use.
+    pub(super) entity_layer_handles: foldhash::HashMap<String, Handle>,
     /// Cached fallback for owners without a direct extension-dictionary handle.
     pub(super) xdic_owner_index: std::sync::Arc<std::collections::HashMap<Handle, Handle>>,
     pub(super) block_users: std::sync::Arc<std::collections::HashMap<Handle, Vec<Handle>>>,
@@ -158,6 +162,12 @@ pub struct DwgObjectWriter<'a> {
     /// the owner up among the block records for every entity made writing a drawing with many
     /// blocks quadratic.
     pub(super) entity_modes: std::sync::Arc<std::collections::HashMap<Handle, u8>>,
+    /// Every handle that will exist in the written file (entities incl. their
+    /// attributes, objects, table records, tables). Reactors pointing anywhere
+    /// else are dropped on write — a deleted DIMENSION otherwise stays listed in
+    /// its DIMSTYLE's reactors (and a deleted VIEWPORT in its layout's), and
+    /// readers report "Object handle not found" / "Object was erased".
+    pub(super) live_handles: std::sync::Arc<HashSet<u64>>,
 }
 
 struct ParallelEntityBatch {
@@ -297,12 +307,14 @@ impl<'a> DwgObjectWriter<'a> {
             class_counts_complete: true,
             owner_overrides: std::collections::HashMap::new(),
             linetype_handles: std::collections::HashMap::new(),
+            entity_layer_handles: foldhash::HashMap::default(),
             xdic_owner_index: std::sync::Arc::new(Self::build_xdic_owner_index(document)),
             block_users: std::sync::Arc::new(Self::build_block_users(document)),
             entity_modes: std::sync::Arc::new(Self::build_entity_modes(
                 document,
                 paper_space_block_handle(document),
             )),
+            live_handles: std::sync::Arc::new(Self::build_live_handles(document)),
         })
     }
 
@@ -352,6 +364,32 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     /// Index the fallback ownership lookup used by `extension_dictionary_handle`.
+    fn build_live_handles(document: &CadDocument) -> HashSet<u64> {
+        let mut s: HashSet<u64> = HashSet::new();
+        for e in document.entities() {
+            s.insert(e.common().handle.value());
+            if let EntityType::Insert(i) = e {
+                for a in &i.attributes { s.insert(a.common.handle.value()); }
+                if let Some(h) = i.seqend_handle { s.insert(h.value()); }
+            }
+        }
+        for h in document.objects.keys() { s.insert(h.value()); }
+        macro_rules! tbl { ($t:expr) => { s.insert($t.handle().value()); for x in $t.iter() { s.insert(x.handle().value()); } } }
+        tbl!(document.layers); tbl!(document.line_types); tbl!(document.text_styles); tbl!(document.block_records);
+        tbl!(document.dim_styles); tbl!(document.app_ids); tbl!(document.views); tbl!(document.vports); tbl!(document.ucss);
+        for b in document.block_records.iter() { s.insert(b.block_entity_handle.value()); s.insert(b.block_end_handle.value()); }
+        s
+    }
+
+    /// Reactors that still point at something in this document.
+    pub(super) fn live_reactors(&self, reactors: &[Handle]) -> Vec<Handle> {
+        reactors.iter().copied().filter(|r| self.live_handles.contains(&r.value())).collect()
+    }
+
+    /// owner → child dictionary (see `xdic_owner_index`). Mirrors the fallback in
+    /// `CadDocument::extension_dictionary_handle`: only dictionaries with a non-null
+    /// handle count, and a dictionary owned by another dictionary is *not* treated as
+    /// that dictionary's extension dictionary (ordinary child dictionaries live there).
     fn build_xdic_owner_index(document: &CadDocument) -> std::collections::HashMap<Handle, Handle> {
         let mut index = std::collections::HashMap::new();
         // Several dictionaries can share one non-dictionary owner, and
@@ -990,12 +1028,15 @@ impl<'a> DwgObjectWriter<'a> {
             .iter()
             .map(|s| s.clone())
             .collect();
+        let shape_files = crate::io::dwg::dwg_writer::unnamed_shape_styles(self.document);
         for style in &entries {
-            self.write_text_style(style);
+            self.write_text_style(style, shape_files.contains(&style.handle));
         }
     }
 
-    fn write_text_style(&mut self, style: &crate::tables::TextStyle) {
+    /// `as_shape_file`: an unnamed STYLE that linetype shape segments draw
+    /// from, written with the shape-file flag (#370).
+    fn write_text_style(&mut self, style: &crate::tables::TextStyle, as_shape_file: bool) {
         let mut eed: Vec<(u64, Vec<u8>)> = self
             .annotative_eed_block_for_handle(style.handle, style.annotative)
             .into_iter()
@@ -1029,7 +1070,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_xref_dependant_bit_value(style.xref_dependent);
 
         // Shape file flag
-        self.writer.write_bit(style.is_shape_file);
+        self.writer.write_bit(style.is_shape_file || as_shape_file);
         // Vertical flag
         self.writer.write_bit(style.is_vertical);
 
@@ -1967,24 +2008,12 @@ impl<'a> DwgObjectWriter<'a> {
             let entity_handles_for_header = if is_xref {
                 Vec::new()
             } else {
-                // Preserve the original order when it still matches the live set.
-                match self.document.block_entity_handles.get(&br.handle) {
-                    Some(orig) => {
-                        use std::collections::HashSet;
-                        let valid: HashSet<u64> = live_handles.iter().map(|h| h.value()).collect();
-                        let filtered: Vec<Handle> = orig
-                            .iter()
-                            .copied()
-                            .filter(|h| valid.contains(&h.value()))
-                            .collect();
-                        if filtered.len() == live_handles.len() {
-                            filtered
-                        } else {
-                            live_handles.clone()
-                        }
-                    }
-                    None => live_handles.clone(),
-                }
+                // br.entity_handles is the canonical draw order (SORTENTS applied on
+                // load, kept in sync by DRAWORDER). Do NOT fall back to the order read
+                // from the original file (document.block_entity_handles): R2004+ readers
+                // take draw order from this header list, so using the stale original
+                // order discarded any reorder that did not add/remove entities.
+                live_handles.clone()
             };
             self.write_block_header_with_handles(br, &entity_handles_for_header);
             self.write_block_begin(br);
@@ -2035,7 +2064,7 @@ impl<'a> DwgObjectWriter<'a> {
                                 ((run.len() + worker_count * 4 - 1) / (worker_count * 4)).max(512);
                             let batches: Vec<ParallelEntityBatch> =
                                 map_chunks(run, chunk_size, |chunk| {
-                                    self.serialize_parallel_entity_batch(chunk)
+                                    self.serialize_parallel_entity_batch(chunk, br.handle)
                                 });
                             for batch in batches {
                                 self.append_parallel_entity_batch(batch);
@@ -2048,7 +2077,7 @@ impl<'a> DwgObjectWriter<'a> {
                                     (start + offset > 0).then(|| handles[start + offset - 1]);
                                 self.next_handle =
                                     (start + offset + 1 < len).then(|| handles[start + offset + 1]);
-                                self.write_entity(&self.document.entities[idx]);
+                                self.write_listed_entity(&self.document.entities[idx], br.handle);
                             }
                         }
                         continue;
@@ -2065,7 +2094,7 @@ impl<'a> DwgObjectWriter<'a> {
                             None
                         };
 
-                        self.write_entity(entity);
+                        self.write_listed_entity(entity, br.handle);
                     }
                     i += 1;
                 }
@@ -2076,6 +2105,25 @@ impl<'a> DwgObjectWriter<'a> {
 
             self.write_block_end(br);
         }
+    }
+
+    /// Write an entity of `record`'s entity list with the record as its
+    /// owner, as the BLOCK/ENDBLK markers are and as the DXF writer writes
+    /// group 330. The entity mode follows the owner handle, so an owner that
+    /// names another record (a DXF 330 of `*Model_Space` on an entity of a
+    /// named block) would write the entity in that space while this record
+    /// lists it, and readers that go by the mode would drop it from the block.
+    fn write_listed_entity(&mut self, entity: &EntityType, record: Handle) {
+        if entity.common().owner_handle == record {
+            self.write_entity(entity);
+            return;
+        }
+        let mut entity = entity.clone();
+        let common = entity.common_mut();
+        common.owner_handle = record;
+        // The verbatim record still holds the old owner.
+        common.raw_record = None;
+        self.write_entity(&entity);
     }
 
     fn parallel_entity_safe(entity: &EntityType) -> bool {
@@ -2096,7 +2144,11 @@ impl<'a> DwgObjectWriter<'a> {
         )
     }
 
-    fn serialize_parallel_entity_batch(&self, handles: &[Handle]) -> ParallelEntityBatch {
+    fn serialize_parallel_entity_batch(
+        &self,
+        handles: &[Handle],
+        record: Handle,
+    ) -> ParallelEntityBatch {
         let encoding = crate::io::dxf::code_page::encoding_from_dwg_code_page(
             crate::io::dxf::code_page::dwg_code_page_index(&self.document.header.code_page),
         );
@@ -2124,12 +2176,14 @@ impl<'a> DwgObjectWriter<'a> {
             xdic_owner_index: self.xdic_owner_index.clone(),
             block_users: self.block_users.clone(),
             entity_modes: self.entity_modes.clone(),
+            live_handles: self.live_handles.clone(),
             owner_overrides: std::collections::HashMap::new(),
             linetype_handles: std::collections::HashMap::new(),
+            entity_layer_handles: foldhash::HashMap::default(),
         };
         for handle in handles {
             if let Some(&idx) = worker.document.entity_index.get(handle) {
-                worker.write_entity(&worker.document.entities[idx]);
+                worker.write_listed_entity(&worker.document.entities[idx], record);
             }
         }
         ParallelEntityBatch {
@@ -2193,23 +2247,38 @@ impl<'a> DwgObjectWriter<'a> {
             extra,
         );
 
-        // Paper-space names stay unique; anonymous names use their native base.
-        let dwg_name = dwg_block_name(self.document, record, self.paper_space_block_handle);
+        // Paper-space headers store the bare name; BLOCK markers keep the
+        // layout suffix so readers can recover distinct block-record names.
+        let dwg_name = if record.is_paper_space() {
+            "*Paper_Space"
+        } else {
+            dwg_block_name(self.document, record, self.paper_space_block_handle)
+        };
         self.writer.write_variable_text(dwg_name);
         // Xref dependant
         self.write_xref_dependant_bit();
 
         // Anonymous flag
         self.writer.write_bit(record.flags.anonymous);
-        // Has attributes
-        let has_attributes = record.entity_handles.iter().any(|handle| {
-            matches!(
-                self.document.get_entity(*handle),
-                Some(EntityType::AttributeDefinition(_))
-            )
-        });
+        // Has attributes: never on a layout block record, as AutoCAD writes it
+        // (ZWCAD's AUDIT flags a layout with the bit set).
+        // A layout handle counts only when it resolves: an orphaned block can
+        // keep a dangling one, and its ATTDEFs still need the bit.
+        let is_layout = record.is_model_space()
+            || record.is_paper_space()
+            || matches!(
+                self.document.objects.get(&record.layout),
+                Some(crate::objects::ObjectType::Layout(_))
+            );
+        let has_attributes = !is_layout
+            && record.entity_handles.iter().any(|handle| {
+                matches!(
+                    self.document.get_entity(*handle),
+                    Some(EntityType::AttributeDefinition(_))
+                )
+            });
         self.writer
-            .write_bit(record.flags.has_attributes || has_attributes);
+            .write_bit(!is_layout && (record.flags.has_attributes || has_attributes));
         // Is xref
         self.writer.write_bit(record.flags.is_xref);
         // Is xref overlay
@@ -2402,11 +2471,15 @@ impl<'a> DwgObjectWriter<'a> {
             &common.edge_visual_style_handle,
         );
 
-        self.writer.write_variable_text(dwg_block_name(
-            self.document,
-            record,
-            self.paper_space_block_handle,
-        ));
+        // An anonymous header stores the bare name (`*U`); its marker keeps the
+        // number (`*U2`), as AutoCAD writes them, so readers that name a
+        // definition after its marker can tell the definitions apart.
+        let marker_name = if record.flags.anonymous && record.name.starts_with('*') {
+            record.name.as_str()
+        } else {
+            dwg_block_name(self.document, record, self.paper_space_block_handle)
+        };
+        self.writer.write_variable_text(marker_name);
 
         self.register_object(common.handle);
     }
@@ -2780,5 +2853,117 @@ mod unregistered_class_tests {
         assert!(
             associative_handles(DxfVersion::AC1018, Some(DxfVersion::AC1018)).contains(&0x7100)
         );
+    }
+}
+
+/// Records of a registered class with semantic properties (#319, a custom class
+/// read from DXF) are written as proxies. The proxy's class number must name
+/// the record's class in the table: 498 and 499 are the proxy type codes, not
+/// classes, and ODA refuses such a proxy ("No ClassId") and recovers the whole
+/// file.
+#[cfg(test)]
+mod registered_class_proxy_tests {
+    use super::*;
+    use crate::classes::DxfClass;
+    use crate::entities::{ExtendedEntity, ExtendedEntityData, RegisteredClassEntityData};
+    use crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader;
+    use crate::objects::{RegisteredClassObject, SemanticProperty, SemanticPropertyValue};
+    use std::collections::HashMap;
+
+    const ENTITY_CLASS: (&str, &str) = ("SPDSNOTE", "mcsDbObjectNote");
+    const OBJECT_CLASS: (&str, &str) = ("SPDSDATACONTAINER", "mcsDbDataContainer");
+    const OBJECT: Handle = Handle::new(0x7300);
+
+    fn properties() -> Vec<SemanticProperty> {
+        vec![SemanticProperty {
+            subclass: ENTITY_CLASS.1.to_string(),
+            code: 1,
+            value: SemanticPropertyValue::Text("Note".to_string()),
+        }]
+    }
+
+    /// A drawing with one registered-class entity and one registered-class
+    /// object, both with properties, and their classes in the table.
+    fn document(version: DxfVersion) -> (CadDocument, Handle) {
+        let mut doc = CadDocument::with_version(version);
+        doc.classes
+            .add_or_update(DxfClass::new_entity(ENTITY_CLASS.0, ENTITY_CLASS.1));
+        doc.classes
+            .add_or_update(DxfClass::new(OBJECT_CLASS.0, OBJECT_CLASS.1));
+        let entity = doc
+            .add_entity(EntityType::Extended(Box::new(ExtendedEntity {
+                common: Default::default(),
+                data: ExtendedEntityData::RegisteredClass(RegisteredClassEntityData {
+                    dxf_name: ENTITY_CLASS.0.to_string(),
+                    cpp_class_name: ENTITY_CLASS.1.to_string(),
+                    properties: properties(),
+                    ..Default::default()
+                }),
+            })))
+            .unwrap();
+        doc.objects.insert(
+            OBJECT,
+            ObjectType::RegisteredClass(RegisteredClassObject {
+                handle: OBJECT,
+                owner: doc.header.named_objects_dict_handle,
+                dxf_name: OBJECT_CLASS.0.to_string(),
+                cpp_class_name: OBJECT_CLASS.1.to_string(),
+                properties: properties(),
+                ..Default::default()
+            }),
+        );
+        (doc, entity)
+    }
+
+    fn class_number(doc: &CadDocument, name: &str) -> i32 {
+        i32::from(doc.classes.get_by_name(name).unwrap().class_number)
+    }
+
+    /// Type code and class number of the proxy records written for `entity`
+    /// and [`OBJECT`].
+    fn written_proxies(doc: &CadDocument, entity: Handle) -> [(i16, i32); 2] {
+        let (output, handles, _, _) = DwgObjectWriter::new(doc).unwrap().write();
+        let offsets: HashMap<u64, i64> = handles
+            .iter()
+            .map(|(handle, offset)| (*handle, i64::from(*offset)))
+            .collect();
+        let reader = DwgObjectReader::new(output, doc.version, offsets.clone()).unwrap();
+        let record = |handle: Handle| {
+            let offset = usize::try_from(offsets[&handle.value()]).unwrap();
+            reader.read_record_at(offset).unwrap()
+        };
+        let (entity_type, mut merged) = record(entity);
+        reader.read_common_entity_data(&mut merged, entity_type);
+        let entity_class = merged.read_bit_long();
+        let (object_type, mut merged) = record(OBJECT);
+        reader.read_common_non_entity_data(&mut merged, object_type);
+        let object_class = merged.read_bit_long();
+        [(entity_type, entity_class), (object_type, object_class)]
+    }
+
+    #[test]
+    fn proxies_of_registered_classes_name_their_class() {
+        for version in [
+            DxfVersion::AC1015,
+            DxfVersion::AC1018,
+            DxfVersion::AC1024,
+            DxfVersion::AC1032,
+        ] {
+            let (doc, entity) = document(version);
+            let [(entity_type, entity_class), (object_type, object_class)] =
+                written_proxies(&doc, entity);
+            assert_eq!(entity_type, common::OBJ_PROXY_ENTITY, "{version:?}");
+            assert_eq!(object_type, common::OBJ_PROXY_OBJECT, "{version:?}");
+            assert_eq!(
+                entity_class,
+                class_number(&doc, ENTITY_CLASS.0),
+                "{version:?}: the proxy entity names no class"
+            );
+            assert_eq!(
+                object_class,
+                class_number(&doc, OBJECT_CLASS.0),
+                "{version:?}: the proxy object names no class"
+            );
+        }
     }
 }

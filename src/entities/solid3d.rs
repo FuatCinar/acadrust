@@ -325,6 +325,14 @@ pub struct AcisData {
     /// for round-trip; 0 when the entity carried no wireframe data).
     #[cfg_attr(feature = "serde", serde(default))]
     pub wireframe_isolines: i32,
+    /// Set by a DWG read with
+    /// [`DwgReadOptions::defer_solid_reference_point`](crate::DwgReadOptions::defer_solid_reference_point):
+    /// the owning entity's `point_of_reference` was left at the origin because
+    /// the file stored none and deriving it would parse the whole modeler
+    /// data. `reference_point()` derives it on request, and a move or
+    /// transform of the entity derives it first, then clears this flag.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reference_point_deferred: bool,
 }
 
 impl AcisData {
@@ -343,6 +351,7 @@ impl AcisData {
             acis_empty_bit: false,
             extra_acis_data: None,
             wireframe_isolines: 0,
+            reference_point_deferred: false,
         }
     }
 
@@ -364,6 +373,7 @@ impl AcisData {
             acis_empty_bit: false,
             extra_acis_data: None,
             wireframe_isolines: 0,
+            reference_point_deferred: false,
         }
     }
 
@@ -382,6 +392,7 @@ impl AcisData {
             acis_empty_bit: false,
             extra_acis_data: None,
             wireframe_isolines: 0,
+            reference_point_deferred: false,
         }
     }
 
@@ -406,6 +417,10 @@ impl AcisData {
     /// append it at serialisation time.  This keeps the representation
     /// consistent regardless of the data source (DXF reader, DWG reader,
     /// user API).
+    ///
+    /// Text that is only whitespace once the terminator is gone (the
+    /// `1 ""` group a body without ACIS data is saved as) gives an empty
+    /// string, so that `has_data()` stays false for it.
     pub fn strip_sat_terminator(sat: &str) -> String {
         let mut result = String::with_capacity(sat.len());
         for line in sat.lines() {
@@ -414,6 +429,9 @@ impl AcisData {
             }
             result.push_str(line);
             result.push('\n');
+        }
+        if result.trim().is_empty() {
+            result.clear();
         }
         result
     }
@@ -483,6 +501,69 @@ impl AcisData {
         }
         let (_m, t, _s) = doc.placement();
         Some(Vector3::new(t[0], t[1], t[2]))
+    }
+
+    /// World-space (min, max) of the B-rep vertex points with the body
+    /// placement applied. `None` when unparsable or no `point` records.
+    pub fn geometry_bounds(&self) -> Option<(Vector3, Vector3)> {
+        let doc = self.parse()?;
+        let (m, tr, sc) = doc.placement();
+        let mut min = [f64::MAX; 3];
+        let mut max = [f64::MIN; 3];
+        let mut count = 0usize;
+        for rec in &doc.records {
+            if rec.entity_type != "point" {
+                continue;
+            }
+            let mut p: Option<[f64; 3]> = None;
+            let mut floats: Vec<f64> = Vec::with_capacity(4);
+            for t in &rec.tokens {
+                if let Some((components, len)) = t.coordinate_components() {
+                    if len == 3 {
+                        p = Some(components);
+                    }
+                } else if let Some(value) = t.as_float() {
+                    floats.push(value);
+                }
+            }
+            let Some([x, y, z]) = p.or_else(|| {
+                (floats.len() >= 3).then(|| {
+                    let n = floats.len();
+                    [floats[n - 3], floats[n - 2], floats[n - 1]]
+                })
+            }) else {
+                continue;
+            };
+            let w = [
+                sc * (x * m[0][0] + y * m[1][0] + z * m[2][0]) + tr[0],
+                sc * (x * m[0][1] + y * m[1][1] + z * m[2][1]) + tr[1],
+                sc * (x * m[0][2] + y * m[1][2] + z * m[2][2]) + tr[2],
+            ];
+            if !(w[0].is_finite() && w[1].is_finite() && w[2].is_finite()) {
+                continue;
+            }
+            for k in 0..3 {
+                min[k] = min[k].min(w[k]);
+                max[k] = max[k].max(w[k]);
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return None;
+        }
+        Some((
+            Vector3::new(min[0], min[1], min[2]),
+            Vector3::new(max[0], max[1], max[2]),
+        ))
+    }
+
+    /// The reference point derived from the geometry itself: the vertex-point
+    /// bounding-box centre ([`geometry_centre`](Self::geometry_centre)), else
+    /// the placement origin ([`placement_origin`](Self::placement_origin)).
+    /// Parses the modeler data on every call, so ask for it when it is needed
+    /// rather than at load time.
+    pub fn reference_centre(&self) -> Option<Vector3> {
+        self.geometry_centre().or_else(|| self.placement_origin())
     }
 
     /// The centre of the body's vertex-point bounding box, in world space
@@ -671,6 +752,29 @@ impl Solid3D {
         }
     }
 
+    /// The solid's reference point: the stored `point_of_reference` when the
+    /// file carried one, else the point derived from the geometry
+    /// ([`AcisData::reference_centre`]), else the origin. After a DWG read with
+    /// `DwgReadOptions::defer_solid_reference_point`, `point_of_reference` stays
+    /// at the origin for a solid whose file stored no anchor; call this to get
+    /// the derived point.
+    pub fn reference_point(&self) -> Vector3 {
+        if self.point_of_reference != Vector3::ZERO {
+            return self.point_of_reference;
+        }
+        self.acis_data.reference_centre().unwrap_or(Vector3::ZERO)
+    }
+
+    /// Fill `point_of_reference` from the geometry when a deferred read left it
+    /// unset, and clear the flag. Called before the solid is moved, so the
+    /// offset is applied to a real point and not to the unset origin.
+    pub(crate) fn resolve_deferred_reference_point(&mut self) {
+        if self.acis_data.reference_point_deferred {
+            self.point_of_reference = self.reference_point();
+            self.acis_data.reference_point_deferred = false;
+        }
+    }
+
     /// Creates a 3D solid from SAT text data.
     pub fn from_sat(sat: &str) -> Self {
         let mut solid = Self::new();
@@ -770,7 +874,12 @@ impl Solid3D {
     /// Calculates bounding box from wireframe data.
     fn wireframe_bounding_box(&self) -> BoundingBox3D {
         if self.wires.is_empty() {
-            return BoundingBox3D::default();
+            // Tel kafes onbellegi yok (AutoCAD R2013+ / DXF): ACIS B-rep
+            // kose noktalarindan sinir kutusu hesapla.
+            return match self.acis_data.geometry_bounds() {
+                Some((lo, hi)) => BoundingBox3D::new(lo, hi),
+                None => BoundingBox3D::default(),
+            };
         }
 
         let mut min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -875,6 +984,24 @@ impl Region {
         }
     }
 
+    /// The region's reference point: the stored `point_of_reference`, else the
+    /// point derived from the geometry ([`AcisData::reference_centre`]), else
+    /// the origin. See [`Solid3D::reference_point`].
+    pub fn reference_point(&self) -> Vector3 {
+        if self.point_of_reference != Vector3::ZERO {
+            return self.point_of_reference;
+        }
+        self.acis_data.reference_centre().unwrap_or(Vector3::ZERO)
+    }
+
+    /// See [`Solid3D::resolve_deferred_reference_point`].
+    pub(crate) fn resolve_deferred_reference_point(&mut self) {
+        if self.acis_data.reference_point_deferred {
+            self.point_of_reference = self.reference_point();
+            self.acis_data.reference_point_deferred = false;
+        }
+    }
+
     /// Creates a region from SAT text data.
     pub fn from_sat(sat: &str) -> Self {
         let mut region = Self::new();
@@ -925,7 +1052,10 @@ impl Entity for Region {
 
     fn bounding_box(&self) -> BoundingBox3D {
         if self.wires.is_empty() {
-            return BoundingBox3D::default();
+            return match self.acis_data.geometry_bounds() {
+                Some((lo, hi)) => BoundingBox3D::new(lo, hi),
+                None => BoundingBox3D::default(),
+            };
         }
 
         let mut min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -1004,6 +1134,24 @@ impl Body {
         }
     }
 
+    /// The body's reference point: the stored `point_of_reference`, else the
+    /// point derived from the geometry ([`AcisData::reference_centre`]), else
+    /// the origin. See [`Solid3D::reference_point`].
+    pub fn reference_point(&self) -> Vector3 {
+        if self.point_of_reference != Vector3::ZERO {
+            return self.point_of_reference;
+        }
+        self.acis_data.reference_centre().unwrap_or(Vector3::ZERO)
+    }
+
+    /// See [`Solid3D::resolve_deferred_reference_point`].
+    pub(crate) fn resolve_deferred_reference_point(&mut self) {
+        if self.acis_data.reference_point_deferred {
+            self.point_of_reference = self.reference_point();
+            self.acis_data.reference_point_deferred = false;
+        }
+    }
+
     /// Creates a body from SAT text data.
     pub fn from_sat(sat: &str) -> Self {
         let mut body = Self::new();
@@ -1054,7 +1202,10 @@ impl Entity for Body {
 
     fn bounding_box(&self) -> BoundingBox3D {
         if self.wires.is_empty() {
-            return BoundingBox3D::default();
+            return match self.acis_data.geometry_bounds() {
+                Some((lo, hi)) => BoundingBox3D::new(lo, hi),
+                None => BoundingBox3D::default(),
+            };
         }
 
         let mut min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);

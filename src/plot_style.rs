@@ -118,7 +118,12 @@ impl PlotStyleTable {
 
     /// Encode this table as CTB/STB file bytes.
     pub fn to_bytes(&self) -> crate::error::Result<Vec<u8>> {
-        compress_ctb(self.to_text().as_bytes())
+        let mut bytes = compress_ctb(self.to_text().as_bytes())?;
+        // A named table is tagged STBVER1 in the same header.
+        if self.is_stb {
+            bytes[19..22].copy_from_slice(b"STB");
+        }
+        Ok(bytes)
     }
 
     /// Resolve the effective print RGB color for the given ACI index.
@@ -178,7 +183,10 @@ impl PlotStyleTable {
         let mut s = String::new();
         let description = self.description.replace(['\r', '\n'], " ");
         s.push_str(&format!("description=\"{description}\n"));
-        s.push_str("aci_table_available=TRUE\n");
+        s.push_str(&format!(
+            "aci_table_available={}\n",
+            if self.is_stb { "FALSE" } else { "TRUE" }
+        ));
         // The factor scales every lineweight when applied, so write it in full.
         s.push_str(&format!("scale_factor={}\n", full_real(self.scale_factor)));
         s.push_str(&format!(
@@ -189,18 +197,39 @@ impl PlotStyleTable {
             "custom_lineweight_display_units={}\n",
             self.custom_lineweight_display_units
         ));
-        s.push_str("aci_table{\n");
-        for index in 0..255 {
-            s.push_str(&format!(" {index}=\"Color_{}\n", index + 1));
-        }
-        s.push_str("}\nplot_style{\n");
-        for (index, entry) in self.aci_entries.iter().enumerate().skip(1).take(255) {
-            let style_index = index - 1;
-            let style_name = if entry.name.is_empty() {
-                format!("Color_{index}")
-            } else {
-                entry.name.replace(['\r', '\n'], " ")
-            };
+        // A named table lists its styles, Normal first; a colour table its
+        // 255 colour styles behind the ACI name table.
+        let styles: Vec<(String, &PlotStyleEntry)> = if self.is_stb {
+            let mut named: Vec<_> = self.named_entries.iter().collect();
+            named.sort_by_key(|(name, _)| (name.as_str() != "Normal", name.as_str()));
+            named
+                .into_iter()
+                .map(|(name, entry)| (name.clone(), entry))
+                .collect()
+        } else {
+            s.push_str("aci_table{\n");
+            for index in 0..255 {
+                s.push_str(&format!(" {index}=\"Color_{}\n", index + 1));
+            }
+            s.push_str("}\n");
+            self.aci_entries
+                .iter()
+                .enumerate()
+                .skip(1)
+                .take(255)
+                .map(|(index, entry)| {
+                    let name = if entry.name.is_empty() {
+                        format!("Color_{index}")
+                    } else {
+                        entry.name.clone()
+                    };
+                    (name, entry)
+                })
+                .collect()
+        };
+        s.push_str("plot_style{\n");
+        for (style_index, (style_name, entry)) in styles.into_iter().enumerate() {
+            let style_name = style_name.replace(['\r', '\n'], " ");
             let localized_name = if entry.localized_name.is_empty() {
                 style_name.clone()
             } else {
@@ -261,9 +290,15 @@ impl PlotStyleTable {
 /// code page those applications write descriptions in.
 fn decompress_ctb(data: &[u8]) -> crate::error::Result<(String, Vec<String>)> {
     const PREFIX: &[u8] = b"PIAFILEVERSION_2.0,CTBVER1,compress\r\npmzlibcodec";
+    // Named tables (.stb) share the header layout, tagged STBVER1.
+    const STB_PREFIX: &[u8] = b"PIAFILEVERSION_2.0,STBVER1,compress\r\npmzlibcodec";
+    const TTB_PREFIX: &[u8] = b"PIAFILEVERSION_2.0,TTBVER1,compress\r\npmzlibcodec";
     let mut warnings = Vec::new();
     let mut decoded;
-    if data.starts_with(PREFIX) {
+    if [PREFIX, STB_PREFIX, TTB_PREFIX]
+        .into_iter()
+        .any(|prefix| data.starts_with(prefix))
+    {
         if data.len() < 60 {
             return Err("CTB header is truncated".into());
         }
@@ -743,6 +778,54 @@ mod round_trip_tests {
         let reloaded = saved_and_reloaded(&table);
         assert_eq!(reloaded.lineweights, table.lineweights);
         assert_eq!(reloaded.resolve_lineweight(1), Some(0.035));
+    }
+}
+
+#[cfg(test)]
+mod named_table_header_tests {
+    use super::{compress_ctb, PlotStyleTable};
+
+    const STB_TEXT: &str = "description=\"\naci_table_available=FALSE\nscale_factor=1\n\
+apply_factor=FALSE\ncustom_lineweight_display_units=0\nplot_style{\n 0{\n  name=\"Normal\n\
+  localized_name=\"Normal\n  color=-1\n  mode_color=-1\n  color_policy=1\n  lineweight=0\n }\n\
+ 1{\n  name=\"Black\n  localized_name=\"Black\n  color=-1023410176\n  mode_color=-1023410176\n\
+  color_policy=5\n  lineweight=8\n }\n}\n";
+
+    /// A named plot style table as CAD applications write it: the same
+    /// 60-byte header as a CTB, tagged `STBVER1` instead of `CTBVER1`.
+    fn stb_file() -> Vec<u8> {
+        let mut bytes = compress_ctb(STB_TEXT.as_bytes()).expect("compress");
+        assert_eq!(&bytes[19..26], b"CTBVER1");
+        bytes[19..22].copy_from_slice(b"STB");
+        bytes
+    }
+
+    #[test]
+    fn a_named_table_with_the_stbver1_header_loads() {
+        let table = PlotStyleTable::from_bytes("named.stb", &stb_file()).expect("loads");
+        assert!(table.is_stb);
+        let black = table.named_entries.get("Black").expect("Black style");
+        assert_eq!(black.color, Some([0, 0, 0]));
+        assert_eq!(black.lineweight, 8);
+        assert!(table.named_entries.contains_key("Normal"));
+        assert!(table.load_warnings.is_empty(), "{:?}", table.load_warnings);
+        // Written back, it keeps its STBVER1 tag.
+        let written = table.to_bytes().expect("write");
+        assert_eq!(&written[19..26], b"STBVER1");
+        let again = PlotStyleTable::from_bytes("named.stb", &written).expect("reloads");
+        assert!(again.named_entries.contains_key("Black"));
+    }
+
+    #[test]
+    fn a_named_table_with_the_ttbver1_header_loads() {
+        let mut bytes = stb_file();
+        bytes[19..22].copy_from_slice(b"TTB");
+        let table = PlotStyleTable::from_bytes("named.stb", &bytes).expect("loads TTBVER1");
+        assert!(table.is_stb);
+        let black = table.named_entries.get("Black").expect("Black style");
+        assert_eq!(black.color, Some([0, 0, 0]));
+        assert_eq!(black.lineweight, 8);
+        assert!(table.load_warnings.is_empty(), "{:?}", table.load_warnings);
     }
 }
 

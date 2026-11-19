@@ -148,7 +148,9 @@ fn chord_flag_does_not_turn_a_control_spline_into_fit_method() {
 
 #[test]
 fn uniform_and_centripetal_fit_splines_survive_dwg_dxf_dwg() {
-    for (parameterization, flags) in [(0, 1056), (1, 1088), (2, 1152)] {
+    // Read from DWG, which does not store the planar bit (8): it follows the
+    // geometry, as in AutoCAD's own DXF.
+    for (parameterization, flags) in [(0, 1064), (1, 1096), (2, 1160)] {
         for target in [DxfVersion::AC1015, DxfVersion::AC1027, DxfVersion::AC1032] {
             let expected = fit_spline(parameterization);
             let mut doc = CadDocument::with_version(DxfVersion::AC1032);
@@ -202,4 +204,25 @@ fn helix_embedded_spline_uses_the_same_extended_flag_mapping() {
         .unwrap();
     assert_eq!(spline.knot_parameterization, 2);
     assert!(spline.cv_frame_visible);
+}
+
+/// A control-point spline read from DWG carries a parameterization (Custom),
+/// but its DXF flags keep only the curve bits, as other writers do (#149).
+#[test]
+fn control_point_spline_from_dwg_writes_no_parameterization_bits() {
+    let mut spline = Spline::new();
+    spline.degree = 2;
+    spline.control_points = vec![
+        Vector3::ZERO,
+        Vector3::new(1.0, 1.0, 0.0),
+        Vector3::new(2.0, 0.0, 0.0),
+    ];
+    spline.knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    spline.flags.closed = true;
+    spline.flags.periodic = true;
+    spline.knot_parameterization = 15;
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    doc.add_entity(EntityType::Spline(spline)).unwrap();
+    let bytes = DxfWriter::new(&doc).write_to_vec().unwrap();
+    assert_eq!(written_flags(&bytes, "SPLINE"), 3);
 }

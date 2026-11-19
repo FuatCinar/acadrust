@@ -150,7 +150,13 @@ impl<R: Read + Seek> DxfTextReader<R> {
         };
 
         // Process special character sequences in strings
-        let value = self.process_string_value(&value_line);
+        let mut value = self.process_string_value(&value_line);
+
+        // R2000-R2004 DXF (ve bu uygulamanin yazdigi eski surumler) ASCII disi karakterleri
+        // \U+XXXX olarak tasir; metin/ad alanlarinda gercek karaktere cevir.
+        if matches!(code, 1 | 2 | 3 | 4 | 6 | 7 | 8 | 300..=309) && value.contains("\\U+") {
+            value = crate::io::dxf::code_page::decode_mif_escapes(&value);
+        }
 
         let pair = DxfCodePair::new(code, value);
         self.observe_pair(&pair, pair_offset);

@@ -251,6 +251,32 @@ bitflags! {
     }
 }
 
+impl CellEdgeFlags {
+    /// The edges as an R2010+ cell style stores them (AcDb::GridLineType:
+    /// 1 top, 2 inside horizontal, 4 bottom, 8 left, 0x10 inside vertical,
+    /// 0x20 right). These flags' own bits are the legacy cell's edge byte,
+    /// where 2 is the right edge; the two differ only in 2 and 0x20.
+    pub fn grid_line_type(self) -> u32 {
+        swap_right_inside_horizontal(self.bits())
+    }
+
+    /// The edges of an R2010+ grid line type value; see [`Self::grid_line_type`].
+    pub fn from_grid_line_type(value: u32) -> Self {
+        Self::from_bits_retain(swap_right_inside_horizontal(value))
+    }
+}
+
+fn swap_right_inside_horizontal(bits: u32) -> u32 {
+    let mut out = bits & !0x22;
+    if bits & 0x02 != 0 {
+        out |= 0x20;
+    }
+    if bits & 0x20 != 0 {
+        out |= 0x02;
+    }
+    out
+}
+
 bitflags! {
     /// Cell state flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -826,6 +852,30 @@ pub struct CellStyle {
 }
 
 impl CellStyle {
+    /// Legacy override bits (pre-R2010 DWG cell, DXF cell group 91) for the
+    /// overrides set through the R2010+ property flags, as the readers and
+    /// editors set them.
+    pub fn property_override_bits(&self) -> i32 {
+        let mut flags = 0;
+        for (property, bits) in [
+            (CellStylePropertyFlags::ALIGNMENT, 0x01),
+            (CellStylePropertyFlags::BACKGROUND_COLOR, 0x02 | 0x04),
+            (CellStylePropertyFlags::CONTENT_COLOR, 0x08),
+            (CellStylePropertyFlags::TEXT_STYLE, 0x10),
+            (CellStylePropertyFlags::TEXT_HEIGHT, 0x20),
+        ] {
+            if self.property_flags.contains(property) {
+                flags |= bits;
+            }
+        }
+        flags
+    }
+
+    /// The stored legacy override bits plus `property_override_bits`.
+    pub fn legacy_override_flags(&self) -> i32 {
+        self.override_flags | self.property_override_bits()
+    }
+
     pub fn overridden(&self) -> CellStylePropertyFlags {
         if self.legacy_override_bits {
             self.property_flags
@@ -837,6 +887,25 @@ impl CellStyle {
 
     pub fn sets(&self, property: CellStylePropertyFlags) -> bool {
         self.overridden().contains(property)
+    }
+
+    /// The margin flag word to store: the stored word, with bit 0 (the six
+    /// margin values follow) set whenever the style overrides a margin or a
+    /// content spacing, so an override made through the property flags is
+    /// written out instead of dropped.
+    pub fn margin_flags_to_write(&self) -> i16 {
+        use CellStylePropertyFlags as P;
+        let margins = P::MARGIN_LEFT
+            | P::MARGIN_TOP
+            | P::MARGIN_RIGHT
+            | P::MARGIN_BOTTOM
+            | P::MARGIN_HORIZONTAL_SPACING
+            | P::MARGIN_VERTICAL_SPACING;
+        if self.property_flags.intersects(margins) {
+            self.margin_override_flags | 1
+        } else {
+            self.margin_override_flags
+        }
     }
 
     /// Creates a default cell style.
@@ -875,6 +944,25 @@ impl CellStyle {
             applied_border_edges: CellEdgeFlags::NONE,
             additional_borders: Vec::new(),
         }
+    }
+
+    /// The border this style overrides on `edge`: an outer edge set in
+    /// `applied_border_edges`, or an inside edge it holds.
+    fn applied_border(&self, edge: CellEdgeFlags) -> Option<&CellBorder> {
+        let border = match edge {
+            CellEdgeFlags::TOP => &self.top_border,
+            CellEdgeFlags::RIGHT => &self.right_border,
+            CellEdgeFlags::BOTTOM => &self.bottom_border,
+            CellEdgeFlags::LEFT => &self.left_border,
+            _ => {
+                return self
+                    .additional_borders
+                    .iter()
+                    .find(|(bits, _)| *bits == edge.grid_line_type())
+                    .map(|(_, border)| border)
+            }
+        };
+        self.applied_border_edges.contains(edge).then_some(border)
     }
 
     /// Sets uniform margins.
@@ -1083,26 +1171,26 @@ impl TableCell {
                 if p.contains(P::BACKGROUND_COLOR) && !style.fill_enabled {
                     style.background_color = Color::ByBlock;
                 }
-                for (color_bit, weight_bit, edge, border) in [
-                    (0x40, 0x400, CellEdgeFlags::TOP, &mut style.top_border),
-                    (0x80, 0x800, CellEdgeFlags::RIGHT, &mut style.right_border),
-                    (
-                        0x100,
-                        0x1000,
-                        CellEdgeFlags::BOTTOM,
-                        &mut style.bottom_border,
-                    ),
-                    (0x200, 0x2000, CellEdgeFlags::LEFT, &mut style.left_border),
-                ] {
-                    if own.override_flags & color_bit != 0 {
-                        border.override_flags |= BorderPropertyFlags::COLOR;
-                    }
-                    if own.override_flags & weight_bit != 0 {
-                        border.override_flags |=
-                            BorderPropertyFlags::LINE_WEIGHT | BorderPropertyFlags::INVISIBILITY;
-                    }
-                    if own.override_flags & (color_bit | weight_bit) != 0 {
-                        style.applied_border_edges |= edge;
+                // Each edge's colour, line weight and visibility have their
+                // own legacy bits (0x40, 0x400, 0x4000, shifted by the edge).
+                for (i, (edge, border)) in [
+                    (CellEdgeFlags::TOP, &mut style.top_border),
+                    (CellEdgeFlags::RIGHT, &mut style.right_border),
+                    (CellEdgeFlags::BOTTOM, &mut style.bottom_border),
+                    (CellEdgeFlags::LEFT, &mut style.left_border),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    for (bit, property) in [
+                        (0x40 << i, BorderPropertyFlags::COLOR),
+                        (0x400 << i, BorderPropertyFlags::LINE_WEIGHT),
+                        (0x4000 << i, BorderPropertyFlags::INVISIBILITY),
+                    ] {
+                        if own.override_flags & bit != 0 {
+                            border.override_flags |= property;
+                            style.applied_border_edges |= edge;
+                        }
                     }
                 }
                 style.override_flags = (p & !CONTENT).bits() as i32;
@@ -1111,6 +1199,183 @@ impl TableCell {
             }
         }
         std::borrow::Cow::Owned(cell)
+    }
+
+    /// The cell as the legacy layout (AcDbTable cell below R2010, ODA's Open
+    /// Design Specification 20.4.96.1) stores it, with the overrides of its
+    /// contents and its own style; [`Table::legacy_layout_cell`] adds those
+    /// of its row, column and table.
+    ///
+    /// The cell type and the value handle (344) come from the contents: a
+    /// block content makes a block cell with its block record, a field
+    /// content puts its FIELD in 344, any other cell is a text cell. A cell
+    /// whose style holds legacy bits (read from a legacy DWG or from DXF)
+    /// keeps its stored word; otherwise the word is built in legacy bits from
+    /// the first override found for each property, content first.
+    pub fn legacy_layout(&self) -> std::borrow::Cow<'_, TableCell> {
+        self.legacy_layout_with(&[])
+    }
+
+    /// `legacy_layout` with the overrides of `inherited` (each style with
+    /// the edges of its own that fall on the cell's top, right, bottom and
+    /// left) after the cell's own.
+    fn legacy_layout_with(
+        &self,
+        inherited: &[(&CellStyle, [CellEdgeFlags; 4])],
+    ) -> std::borrow::Cow<'_, TableCell> {
+        let (cell_type, value_handle) = self.legacy_value();
+        let legacy = self.style.as_ref().is_some_and(|s| s.legacy_override_bits);
+        let style = (!legacy)
+            .then(|| self.legacy_override_style(cell_type, inherited))
+            .flatten();
+        if cell_type == self.cell_type
+            && value_handle == self.value_handle
+            && (legacy || (style.is_none() && self.style.is_none()))
+        {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut cell = self.clone();
+        cell.cell_type = cell_type;
+        cell.value_handle = value_handle;
+        if !legacy {
+            cell.style = style;
+        }
+        std::borrow::Cow::Owned(cell)
+    }
+
+    /// The legacy cell type and value handle, from the contents.
+    fn legacy_value(&self) -> (CellType, Option<Handle>) {
+        if let Some(block) = self
+            .contents
+            .iter()
+            .find(|content| content.content_type == TableCellContentType::Block)
+        {
+            return (CellType::Block, block.block_handle.or(self.value_handle));
+        }
+        if let Some(field) = self
+            .contents
+            .iter()
+            .find_map(|content| content.field_handle)
+        {
+            return (CellType::Text, Some(field));
+        }
+        match self.cell_type {
+            // A block cell with no contents keeps its block record.
+            CellType::Block if self.contents.is_empty() => (CellType::Block, self.value_handle),
+            // A text cell's 344 is its FIELD; a block cell's record is not.
+            CellType::Block => (CellType::Text, None),
+            CellType::Text => (CellType::Text, self.value_handle),
+        }
+    }
+
+    /// The cell's overrides in legacy bits, each from the first of the
+    /// content, the cell's style and `inherited` that overrides it; `None`
+    /// when there is none and the cell has no style.
+    fn legacy_override_style(
+        &self,
+        cell_type: CellType,
+        inherited: &[(&CellStyle, [CellEdgeFlags; 4])],
+    ) -> Option<CellStyle> {
+        use CellStylePropertyFlags as P;
+        const EDGES: [CellEdgeFlags; 4] = [
+            CellEdgeFlags::TOP,
+            CellEdgeFlags::RIGHT,
+            CellEdgeFlags::BOTTOM,
+            CellEdgeFlags::LEFT,
+        ];
+        let styles: Vec<(&CellStyle, [CellEdgeFlags; 4])> = self
+            .style
+            .iter()
+            .map(|style| (style, EDGES))
+            .chain(inherited.iter().copied())
+            .collect();
+        let content = |property: P| self.contents.first().filter(|c| c.sets(property));
+        let style = |property: P| {
+            styles
+                .iter()
+                .map(|(style, _)| *style)
+                .find(|style| style.sets(property))
+        };
+        let mut out = CellStyle::new();
+        let mut word = 0;
+        if let Some(content) = content(P::ALIGNMENT) {
+            word |= 0x01;
+            out.alignment = content.alignment;
+        } else if let Some(style) = style(P::ALIGNMENT) {
+            word |= 0x01;
+            out.alignment = style.alignment;
+        }
+        if let Some(style) = style(P::BACKGROUND_COLOR) {
+            word |= 0x02 | 0x04;
+            out.fill_enabled = style.fill_enabled;
+            out.background_color = style.background_color;
+        }
+        if let Some(content) = content(P::CONTENT_COLOR) {
+            word |= 0x08;
+            out.content_color = content.color;
+        } else if let Some(style) = style(P::CONTENT_COLOR) {
+            word |= 0x08;
+            out.content_color = style.content_color;
+        }
+        // The text style and height are a text cell's: ODA's own save gives
+        // the row's text height to the text cells of the row only.
+        if cell_type == CellType::Text {
+            if let Some(content) = content(P::TEXT_STYLE) {
+                word |= 0x10;
+                out.text_style_handle = content.text_style_handle;
+                out.text_style_name = content.text_style_name.clone();
+            } else if let Some(style) = style(P::TEXT_STYLE) {
+                word |= 0x10;
+                out.text_style_handle = style.text_style_handle;
+                out.text_style_name = style.text_style_name.clone();
+            }
+            if let Some(content) = content(P::TEXT_HEIGHT) {
+                word |= 0x20;
+                out.text_height = content.text_height;
+            } else if let Some(style) = style(P::TEXT_HEIGHT) {
+                word |= 0x20;
+                out.text_height = style.text_height;
+            }
+        }
+        // Per edge (top, right, bottom, left): colour 0x40, line weight
+        // 0x400 and visibility 0x4000, shifted by the edge.
+        for (i, border) in [
+            &mut out.top_border,
+            &mut out.right_border,
+            &mut out.bottom_border,
+            &mut out.left_border,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (bit, property) in [
+                (0x40 << i, BorderPropertyFlags::COLOR),
+                (0x400 << i, BorderPropertyFlags::LINE_WEIGHT),
+                (0x4000 << i, BorderPropertyFlags::INVISIBILITY),
+            ] {
+                let Some(from) = styles.iter().find_map(|(style, edges)| {
+                    style
+                        .applied_border(edges[i])
+                        .filter(|from| from.override_flags.contains(property))
+                }) else {
+                    continue;
+                };
+                word |= bit;
+                if property == BorderPropertyFlags::COLOR {
+                    border.color = from.color;
+                } else if property == BorderPropertyFlags::LINE_WEIGHT {
+                    border.line_weight = from.line_weight;
+                } else {
+                    border.invisible = from.invisible;
+                }
+            }
+        }
+        if word == 0 && self.style.is_none() {
+            return None;
+        }
+        out.override_flags = word;
+        out.legacy_override_bits = true;
+        Some(out)
     }
 
     pub fn set_text(&mut self, s: &str) {
@@ -1704,7 +1969,8 @@ impl Table {
         self.set_merged_ranges(ranges);
     }
 
-    pub(crate) fn canonical_merged_ranges(&self) -> Vec<CellRange> {
+    /// Read the explicit ranges and legacy merge anchors as one ordered list.
+    pub fn canonical_merged_ranges(&self) -> Vec<CellRange> {
         let row_count = self.rows.len();
         let column_count = self.columns.len();
         if row_count == 0 || column_count == 0 {
@@ -1925,6 +2191,61 @@ impl Table {
     /// Returns the number of rows.
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// The cell at `row`, `column` as the legacy layout (AcDbTable cell
+    /// below R2010) stores it: [`TableCell::legacy_layout`], with the
+    /// overrides of the row, the column and the table after the cell's own.
+    /// The legacy layout has no row, column or table cell styles, so what
+    /// they override lands in the cell, each border on the edges it covers:
+    /// a row's top and bottom, its left and right at the ends of the row and
+    /// its inside vertical edges between; a column's the other way round;
+    /// the table's outer edges at its border and its inside edges elsewhere.
+    pub fn legacy_layout_cell(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Option<std::borrow::Cow<'_, TableCell>> {
+        use CellEdgeFlags as E;
+        let cells = &self.rows.get(row)?.cells;
+        let cell = cells.get(column)?;
+        let last_row = row.saturating_add(cell.merge_height.max(1) as usize - 1);
+        let last_column = column.saturating_add(cell.merge_width.max(1) as usize - 1);
+        let top = if row == 0 {
+            E::TOP
+        } else {
+            E::INSIDE_HORIZONTAL
+        };
+        let bottom = if last_row + 1 >= self.rows.len() {
+            E::BOTTOM
+        } else {
+            E::INSIDE_HORIZONTAL
+        };
+        let left = if column == 0 {
+            E::LEFT
+        } else {
+            E::INSIDE_VERTICAL
+        };
+        let right = if last_column + 1 >= cells.len() {
+            E::RIGHT
+        } else {
+            E::INSIDE_VERTICAL
+        };
+        let inherited: Vec<(&CellStyle, [CellEdgeFlags; 4])> = [
+            (
+                self.rows[row].style.as_ref(),
+                [E::TOP, right, E::BOTTOM, left],
+            ),
+            (
+                self.columns.get(column).and_then(|c| c.style.as_ref()),
+                [top, E::RIGHT, bottom, E::LEFT],
+            ),
+            (self.base_style.as_ref(), [top, right, bottom, left]),
+        ]
+        .into_iter()
+        .filter_map(|(style, edges)| Some((style?, edges)))
+        .collect();
+        Some(cell.legacy_layout_with(&inherited))
     }
 
     /// Returns the number of columns.
@@ -2310,6 +2631,18 @@ impl Default for TableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_line_type_is_the_r2010_edge_value() {
+        // AcDb::GridLineType: 0x20 right, 2 inside horizontal (#453).
+        assert_eq!(CellEdgeFlags::RIGHT.grid_line_type(), 0x20);
+        assert_eq!(CellEdgeFlags::INSIDE_HORIZONTAL.grid_line_type(), 2);
+        assert_eq!(
+            CellEdgeFlags::from_grid_line_type(0x21),
+            CellEdgeFlags::TOP | CellEdgeFlags::RIGHT
+        );
+        assert_eq!(CellEdgeFlags::LEFT.grid_line_type(), 8);
+    }
 
     #[test]
     fn test_table_creation() {
@@ -2923,10 +3256,14 @@ pub fn cell_override_bit(code: i32) -> Option<i32> {
         65 => 0x80,
         66 => 0x100,
         68 => 0x200,
-        279 | 289 => 0x400,
-        275 | 285 => 0x800,
-        276 | 286 => 0x1000,
-        278 | 288 => 0x2000,
+        279 => 0x400,
+        275 => 0x800,
+        276 => 0x1000,
+        278 => 0x2000,
+        289 => 0x4000,
+        285 => 0x8000,
+        286 => 0x10000,
+        288 => 0x20000,
         _ => return None,
     })
 }

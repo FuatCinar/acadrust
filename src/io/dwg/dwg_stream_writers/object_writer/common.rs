@@ -315,7 +315,20 @@ impl<'a> DwgObjectWriter<'a> {
     /// never added, or renamed a layer in place so the entities still carry the
     /// old name. Fall back to layer "0", which every drawing has and which
     /// cannot be renamed or deleted, so the reference stays resolvable.
-    fn entity_layer_handle(&self, layer: &str) -> Handle {
+    ///
+    /// Every entity asks, and a table lookup normalizes the name into a new
+    /// string, so the answer is kept per name as written: the document is
+    /// borrowed for the whole write and cannot change under the cache.
+    fn entity_layer_handle(&mut self, layer: &str) -> Handle {
+        if let Some(&handle) = self.entity_layer_handles.get(layer) {
+            return handle;
+        }
+        let handle = self.resolve_entity_layer_handle(layer);
+        self.entity_layer_handles.insert(layer.to_owned(), handle);
+        handle
+    }
+
+    fn resolve_entity_layer_handle(&self, layer: &str) -> Handle {
         if let Some(entry) = self.document.layers.get(layer) {
             if !entry.handle.is_null() {
                 return entry.handle;
@@ -405,10 +418,11 @@ impl<'a> DwgObjectWriter<'a> {
         }
 
         // ── MAIN + HANDLE: reactors + xdic ──
-        // Reactor count (MAIN)
+        // Reactor count (MAIN) — dangling reactors dropped (see `live_handles`)
+        let reactors = self.live_reactors(reactors);
         self.writer.write_bit_long(reactors.len() as i32);
         // Reactor handles (HANDLE)
-        for r in reactors {
+        for r in &reactors {
             self.writer
                 .write_handle(DwgReferenceType::SoftPointer, r.value());
         }
@@ -745,6 +759,33 @@ impl<'a> DwgObjectWriter<'a> {
             false,
             false,
             None,
+            false,
+        );
+    }
+
+    /// As [`write_common_non_entity_data_eed`], but each extra EED block is
+    /// the whole record of its application: it replaces the source record
+    /// instead of being merged into it.
+    pub(super) fn write_common_non_entity_data_replacing_eed(
+        &mut self,
+        type_code: i16,
+        handle: Handle,
+        owner_handle: Handle,
+        reactors: &[Handle],
+        xdictionary_handle: &Option<Handle>,
+        extra_eed: Vec<(u64, Vec<u8>)>,
+    ) {
+        self.write_common_non_entity_data_eed_internal(
+            type_code,
+            handle,
+            owner_handle,
+            reactors,
+            xdictionary_handle,
+            extra_eed,
+            false,
+            false,
+            None,
+            true,
         );
     }
 
@@ -766,6 +807,7 @@ impl<'a> DwgObjectWriter<'a> {
             true,
             false,
             None,
+            false,
         );
     }
 
@@ -790,6 +832,7 @@ impl<'a> DwgObjectWriter<'a> {
             false,
             true,
             Some(has_ds_data),
+            false,
         );
     }
 
@@ -804,6 +847,7 @@ impl<'a> DwgObjectWriter<'a> {
         relative_owner: bool,
         complete_common: bool,
         has_ds_data_override: Option<bool>,
+        replace_extra: bool,
     ) {
         // ── writeCommonData portion ──
 
@@ -854,7 +898,10 @@ impl<'a> DwgObjectWriter<'a> {
                 },
             );
             if let (Some(application), Some(values)) = (application, values) {
-                if eed.get_record(&application.name).is_none() {
+                if replace_extra {
+                    // The block is the application's whole record.
+                    eed.remove_record(&application.name);
+                } else if eed.get_record(&application.name).is_none() {
                     if let Some(values) = self.existing_xdata_values(handle, &application.name) {
                         let mut source = crate::xdata::ExtendedDataRecord::new(&application.name);
                         source.values = values;
@@ -908,11 +955,13 @@ impl<'a> DwgObjectWriter<'a> {
             reactors
         };
 
+        // Dangling reactors dropped (see `live_handles`)
+        let reactors_to_write = self.live_reactors(reactors_to_write);
         // MAIN: Reactor count
         self.writer.write_bit_long(reactors_to_write.len() as i32);
 
         // HANDLE: Reactor handles
-        for r in reactors_to_write {
+        for r in &reactors_to_write {
             self.writer
                 .write_handle(DwgReferenceType::SoftPointer, r.value());
         }
@@ -1068,11 +1117,36 @@ impl<'a> DwgObjectWriter<'a> {
                 .iter()
                 .any(|a| a.handle.value() == app)
         };
+        // A blob whose decoded record has been edited since (an XDATA point
+        // moved with its entity, a plugin rewrite) gives way to the record.
+        let wide = self.dxf_version >= crate::types::DxfVersion::AC1021;
+        let edited = |app: u64, bytes: &[u8]| {
+            let Some(name) = self
+                .document
+                .app_ids
+                .iter()
+                .find(|a| a.handle.value() == app)
+                .map(|a| a.name.as_str())
+            else {
+                return false;
+            };
+            let Some(record) = xdata.get_record(name) else {
+                return false;
+            };
+            crate::io::dwg::eed_codec::decode_values(bytes, wide, |handle| {
+                self.document
+                    .layers
+                    .iter()
+                    .find(|layer| layer.handle.value() == handle)
+                    .map(|layer| layer.name.clone())
+            })
+            .is_some_and(|values| values != record.values)
+        };
         let raw_blocks: Vec<(u64, Vec<u8>)> = if eed_compatible {
             xdata
                 .raw_dwg_eed
                 .iter()
-                .filter(|(app, _)| registered(*app))
+                .filter(|(app, bytes)| registered(*app) && !edited(*app, bytes))
                 .cloned()
                 .collect()
         } else {
@@ -1137,6 +1211,23 @@ impl<'a> DwgObjectWriter<'a> {
             .get_by_name(dxf_name)
             .map(|c| c.class_number)
             .unwrap_or(fallback)
+    }
+
+    /// Type code for a record read from a source file: keeps `source` while
+    /// it still names a class called `dxf_name`. Two classes may share a DXF
+    /// name (AEC drawings carry two `AEC_LIST_DEF` entries), so the lookup
+    /// by name would move the objects of one of them to the other class.
+    pub fn source_class_type_code(&self, dxf_name: &str, source: i16) -> i16 {
+        let kept = self
+            .document
+            .classes
+            .iter()
+            .any(|c| c.class_number == source && c.dxf_name.eq_ignore_ascii_case(dxf_name));
+        if kept {
+            source
+        } else {
+            self.class_type_code(dxf_name, source)
+        }
     }
 
     // ── entity-mode helper ──────────────────────────────────────────

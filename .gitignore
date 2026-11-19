@@ -22,24 +22,27 @@ Thumbs.db
 *.dxf
 *.dxb
 *.dwg
-!/tests/fixtures/r12/cad-created/*.dxf
 *.dwl
 *.dwl2
 *.dmp
 /crash_report.txt
-/ErrorReports/
-/*.log
-
 
 
 # Documentation
 /docs/site/
 
-# Local CAD oracle material (kept outside the tracked tree).
-/src/docs/OpenDesign_Specification_for_.dwg_files.pdf
-/src/docs/explode_audit.md
-/tests/autocad/
-/tests/bricscad/
-/tests/acad/
-/tests/bcad/
-
+src/android_jni.rs
+src/block_insert.rs
+*.patch
+build.log
+MERGE_NOTLARI.md
+/src/android_jni.rs
+/src/block_insert.rs
+/src/ncz_linetype.rs
+/src/cad_fill.rs
+/src/dim_render.rs
+/src/gradient_fill.rs
+/src/hatch_patterns.rs
+/src/raster_export.rs
+/src/tolerance_render.rs
+/src/io/dxf/reader/mem_checkpoint.rs

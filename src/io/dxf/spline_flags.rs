@@ -45,7 +45,11 @@ pub(super) fn write(spline: &Spline) -> i16 {
                 || (!spline.fit_points.is_empty() && spline.control_points.is_empty())
         }
     };
-    if fit_method || spline.knot_parameterization != 0 || spline.dxf_flags & PARAMETERIZATION != 0 {
+    // Parameterization belongs to the fit method. A control-point spline gets
+    // it only when its own DXF carried it: a DWG keeps a parameterization on
+    // every spline, and writing it for a control-point one sets a bit (256,
+    // Custom) other writers leave clear (#149).
+    if fit_method || spline.dxf_flags & PARAMETERIZATION != 0 {
         flags |= match spline.knot_parameterization {
             0 => 32,
             1 => 64,
@@ -69,7 +73,9 @@ pub(super) fn write(spline: &Spline) -> i16 {
     if spline.flags.rational {
         flags |= 4;
     }
-    if spline.flags.planar {
+    // A DWG does not store the planar bit, so a spline read from one gets it
+    // from its geometry; a DXF spline keeps the bit it was read with.
+    if spline.flags.planar || (spline.dwg_scenario.is_some() && spline.is_planar()) {
         flags |= 8;
     }
     if spline.flags.linear {

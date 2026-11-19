@@ -1,5 +1,6 @@
 //! Byte-aligned entity records used by AC1009 (R11/R12) drawings.
 
+use super::header::Revision;
 use crate::error::{DxfError, Result};
 use crate::io::dwg::crc::crc16;
 use crate::io::dxf::code_page::{
@@ -516,11 +517,11 @@ fn encode_record(
         if flag & 2 != 0 {
             writer.short(super::tables::linetype_index(tables, ltype)?);
         }
-        if flag & 8 != 0 {
-            writer.double(record.number(39, 0.));
-        }
         if flag & 4 != 0 {
             writer.double(elevation);
+        }
+        if flag & 8 != 0 {
+            writer.double(record.number(39, 0.));
         }
         if flag & 32 != 0 {
             let bytes = handle.to_be_bytes();
@@ -813,11 +814,24 @@ pub(crate) fn decode_entities(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn decode_positioned_entities(
     bytes: &[u8],
     tables: &EntityTables,
     base_address: u32,
     code_page: &str,
+) -> Result<Vec<PositionedRecord>> {
+    decode_positioned_entities_for(bytes, tables, base_address, code_page, Revision::R11R12)
+}
+
+/// Decode an entity section of either revision. R10 records have no CRC, so
+/// each one has to be consumed exactly instead.
+pub(crate) fn decode_positioned_entities_for(
+    bytes: &[u8],
+    tables: &EntityTables,
+    base_address: u32,
+    code_page: &str,
+    revision: Revision,
 ) -> Result<Vec<PositionedRecord>> {
     let section_size =
         u32::try_from(bytes.len()).map_err(|_| invalid("R12 entity section size overflow"))?;
@@ -838,15 +852,25 @@ pub(crate) fn decode_positioned_entities(
             .get(offset..offset + size)
             .ok_or_else(|| invalid("R12 entity exceeds section bounds"))?;
         let is_jump = header[0] & 127 == 18;
-        let crc_offset = if is_jump { 8 } else { size - 2 };
-        let expected = raw
-            .get(crc_offset..crc_offset + 2)
-            .ok_or_else(|| invalid("Truncated R12 JUMP record"))?;
-        let expected = u16::from_le_bytes(expected.try_into().unwrap());
-        if crc16(0xC0C1, &raw[..crc_offset]) != expected {
-            return Err(invalid(format!(
-                "R12 entity CRC mismatch at section offset {offset}"
-            )));
+        let crc_offset = match revision {
+            // An R10 JUMP may carry unused bytes after its address.
+            Revision::R10 if is_jump => 8.min(size),
+            Revision::R10 => size,
+            Revision::R11R12 if is_jump => 8,
+            Revision::R11R12 => size - 2,
+        };
+        if revision == Revision::R11R12 {
+            let expected = raw
+                .get(crc_offset..crc_offset + 2)
+                .ok_or_else(|| invalid("Truncated R12 JUMP record"))?;
+            let expected = u16::from_le_bytes(expected.try_into().unwrap());
+            if crc16(0xC0C1, &raw[..crc_offset]) != expected {
+                return Err(invalid(format!(
+                    "R12 entity CRC mismatch at section offset {offset}"
+                )));
+            }
+        } else if is_jump && size < 8 {
+            return Err(invalid("Truncated R10 JUMP record"));
         }
         let address = base_address
             .checked_add(u32::try_from(offset).map_err(|_| invalid("R12 entity offset overflow"))?)
@@ -866,7 +890,7 @@ pub(crate) fn decode_positioned_entities(
         // reach its target.
         if !deleted || is_jump {
             let (mut record, owner) =
-                decode_record_with_owner(&raw[..crc_offset], tables, code_page).map_err(
+                decode_record_with_owner(&raw[..crc_offset], tables, code_page, revision).map_err(
                     |error| {
                         invalid(format!(
                             "R12 entity type {} at file offset {:#x}: {error}",
@@ -890,14 +914,16 @@ pub(crate) fn decode_positioned_entities(
 
 #[cfg(test)]
 fn decode_record(bytes: &[u8], t: &EntityTables, code_page: &str) -> Result<EntityRecord> {
-    Ok(decode_record_with_owner(bytes, t, code_page)?.0)
+    Ok(decode_record_with_owner(bytes, t, code_page, Revision::R11R12)?.0)
 }
 
 fn decode_record_with_owner(
     bytes: &[u8],
     t: &EntityTables,
     code_page: &str,
+    revision: Revision,
 ) -> Result<(EntityRecord, Option<u32>)> {
+    let r10 = revision == Revision::R10;
     let mut r = Reader::new(bytes, code_page);
     let kind = r.byte()? & 127;
     let flag = r.byte()?;
@@ -910,6 +936,11 @@ fn decode_record_with_owner(
     }
     out.put(8, table_name(&t.layers, r.short()?)?);
     let options = r.ushort()?;
+    if r10 && flag & 64 != 0 {
+        // R11 introduced this bit for the extra flag byte (paper space,
+        // extended data). Its meaning in R10 is unknown.
+        return Err(invalid("Unsupported R10 entity flag 0x40"));
+    }
     let extra = if flag & 64 != 0 { r.byte()? } else { 0 };
     if extra & 1 != 0 {
         out.put(67, 1);
@@ -922,18 +953,27 @@ fn decode_record_with_owner(
         out.put(62, r.byte()? as i8 as i16);
     }
     if flag & 2 != 0 {
-        let index = r.short()?;
+        let index = if r10 {
+            // R10 stores the linetype index in one byte; 255 is BYBLOCK.
+            // BYLAYER is the absence of the field.
+            match r.byte()? {
+                255 => 32766,
+                index => i16::from(index),
+            }
+        } else {
+            r.short()?
+        };
         out.put(6, super::tables::linetype_name(t, index)?);
     }
     let is3d = matches!(kind, 1 | 2 | 21 | 22);
-    if flag & 8 != 0 {
-        out.put(39, r.double()?);
-    }
     let elevation = if flag & 4 != 0 && !is3d {
         r.double()?
     } else {
         0.
     };
+    if flag & 8 != 0 {
+        out.put(39, r.double()?);
+    }
     if flag & 32 != 0 {
         let size = r.byte()? as usize;
         if size > 8 {
@@ -952,6 +992,15 @@ fn decode_record_with_owner(
         out.put(66, 1);
     }
     let owner = decode_geometry(&mut r, &mut out, t, options, flag, elevation)?;
+    // Without a CRC, a record that is not used up exactly means the layout
+    // was misread.
+    if r10 && r.pos != bytes.len() {
+        return Err(invalid(format!(
+            "R10 {} record has {} unread bytes",
+            out.kind,
+            bytes.len() - r.pos
+        )));
+    }
     Ok((out, owner))
 }
 
@@ -2040,17 +2089,17 @@ mod tests {
     }
 
     #[test]
-    fn native_common_fields_use_short_linetype_indices_and_thickness_before_elevation() {
+    fn native_common_fields_use_short_linetype_indices_and_elevation_before_thickness() {
         let mut tables = tables();
         tables.linetypes = (0..300).map(|i| format!("L{i}")).collect();
         // Independently assembled native CIRCLE: linetype 257, thickness 2,
         // elevation 3, handle A5B6, center (4, 5), radius 6.
-        // Field layout: CC0-1.0 dwg_ac1009.ksy, entity_circle, in
-        // https://github.com/michal-josef-spacek/CAD-Format-DWG-AC1009
+        // AutoCAD 2025 independently confirms elevation before thickness;
+        // the earlier third-party-layout-based ordering was reversed.
         let mut raw = vec![3, 0x2e, 0, 0, 0, 0, 0, 0];
         raw.extend_from_slice(&257i16.to_le_bytes());
-        raw.extend_from_slice(&2f64.to_le_bytes());
         raw.extend_from_slice(&3f64.to_le_bytes());
+        raw.extend_from_slice(&2f64.to_le_bytes());
         raw.extend_from_slice(&[2, 0xa5, 0xb6]);
         for value in [4f64, 5., 6.] {
             raw.extend_from_slice(&value.to_le_bytes());
@@ -2073,6 +2122,68 @@ mod tests {
             if index == 32766 {
                 let encoded = encode_record(&decoded, &tables, 0, "ANSI_1252").unwrap();
                 assert_eq!(&encoded[..encoded.len() - 2], raw);
+            }
+        }
+    }
+
+    fn planar_common_fixture(kind: u8, elevation: f64, thickness: f64) -> Vec<u8> {
+        // Independent AutoCAD check: an AC1009 ARC/CIRCLE with both fields
+        // consumes elevation before thickness. Keep distinct values so a
+        // symmetric reader/writer mistake cannot pass as a round trip.
+        let flags = u8::from(elevation != 0.0) * 4 | u8::from(thickness != 0.0) * 8;
+        let mut raw = vec![kind, flags, 0, 0, 0, 0, 0, 0];
+        if elevation != 0.0 {
+            raw.extend_from_slice(&elevation.to_le_bytes());
+        }
+        if thickness != 0.0 {
+            raw.extend_from_slice(&thickness.to_le_bytes());
+        }
+        for value in [4f64, 5.0, 6.0] {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        if kind == 8 {
+            for angle in [0.25f64, 1.25] {
+                raw.extend_from_slice(&angle.to_le_bytes());
+            }
+        }
+        let length = (raw.len() + 2) as u16;
+        raw[2..4].copy_from_slice(&length.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn native_arc_and_circle_read_elevation_before_thickness() {
+        for kind in [3, 8] {
+            for (elevation, thickness) in [(3.0, 2.0), (0.0, 2.0), (3.0, 0.0), (0.0, 0.0)] {
+                let raw = planar_common_fixture(kind, elevation, thickness);
+                let decoded = decode_record(&raw, &tables(), "ANSI_1252").unwrap();
+                assert_eq!(
+                    (decoded.number(30, 0.0), decoded.number(39, 0.0)),
+                    (elevation, thickness),
+                    "kind={kind}"
+                );
+                assert_eq!(decoded.number(40, 0.0), 6.0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_arc_and_circle_write_elevation_before_thickness() {
+        for (kind, name) in [(3, "CIRCLE"), (8, "ARC")] {
+            for (elevation, thickness) in [(3.0, 2.0), (0.0, 2.0), (3.0, 0.0), (0.0, 0.0)] {
+                let mut source = record(name);
+                source.put(10, 4.0);
+                source.put(20, 5.0);
+                source.put(30, elevation);
+                source.put(39, thickness);
+                source.put(40, 6.0);
+                if kind == 8 {
+                    source.put(50, 0.25f64.to_degrees());
+                    source.put(51, 1.25f64.to_degrees());
+                }
+                let encoded = encode_record(&source, &tables(), 0, "ANSI_1252").unwrap();
+                let expected = planar_common_fixture(kind, elevation, thickness);
+                assert_eq!(&encoded[..encoded.len() - 2], expected, "kind={kind}");
             }
         }
     }

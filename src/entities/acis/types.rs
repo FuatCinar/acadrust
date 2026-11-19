@@ -524,18 +524,24 @@ impl fmt::Display for SatToken {
                         if index != 0 {
                             write!(f, " ")?;
                         }
-                        write!(f, "{}", value)?;
+                        write!(f, "{}", super::writer::format_float(*value))?;
                     }
                     Ok(())
+                } else if let Some(value) = self.as_float().filter(|_| matches!(*tag, 0x05 | 0x06))
+                {
+                    // The ACIS number form, as `SatWriter` writes `SatToken::Float`.
+                    write!(f, "{}", super::writer::format_float(value))
                 } else if let Some(value) = self.as_integer() {
-                    write!(f, "{}", value)
-                } else if let Some(value) = self.as_float() {
                     write!(f, "{}", value)
                 } else if let Some(value) =
                     sab_string_bytes(*tag, data).and_then(|bytes| std::str::from_utf8(bytes).ok())
                 {
                     if matches!(*tag, 0x0D | 0x0E) {
                         write!(f, "{}", value)
+                    } else if *tag == 0x12 {
+                        // An ASM literal string is the record's own fields
+                        // (a `transform` body), not a counted string.
+                        write!(f, "{}", value.trim_end())
                     } else {
                         write!(f, "@{} {}", value.len(), value)
                     }
@@ -1415,6 +1421,13 @@ impl<'a> SatIntCurve<'a> {
         }
     }
 
+    /// Sense of the curve against its B-spline (the token after the history
+    /// pointer, `forward` or `reversed`). A `reversed` intcurve runs against
+    /// its spline: curve parameter t is spline parameter −t.
+    pub fn sense(&self) -> Sense {
+        self.record.token_sense(1)
+    }
+
     /// Parse the embedded spline block into homogeneous control points.
     pub fn bspline(&self) -> Option<(usize, Vec<f64>, Vec<[f64; 4]>)> {
         decode_bspline_curve(&self.record.tokens)
@@ -2008,6 +2021,11 @@ fn decode_spline_definition(
         Some("cyl_spl_sur") => {
             decode_extruded_surface(document, tokens).or_else(|| decode_fitted_extrusion(tokens))
         }
+        // A revolution saved without its fitted spline keeps only the
+        // profile, the axis and the ranges; it is rebuilt exactly from them.
+        Some("rot_spl_sur") => {
+            decode_revolved_surface(document, tokens).or_else(|| decode_bspline_surface(tokens))
+        }
         _ => decode_bspline_surface(tokens),
     }
 }
@@ -2164,6 +2182,181 @@ fn decode_extruded_surface(
     })
 }
 
+/// Whether a sweep's `u` range runs against its profile's parameter. ACIS
+/// often saves sum and revolution surfaces with `u = -t`, and their pcurves
+/// then hold `-t`: a spline built along `t` leaves every pcurve off the
+/// surface and the face unmeshed. `None` when the range fits neither.
+fn runs_against_profile(degree: usize, knots: &[f64], low: f64, high: f64) -> Option<bool> {
+    let first = *knots.get(degree)?;
+    let last = *knots.get(knots.len().checked_sub(degree + 1)?)?;
+    let tolerance = 1e-6 * (last - first).abs().max(1.0);
+    let within = |from: f64, to: f64| low >= from - tolerance && high <= to + tolerance;
+    if within(first, last) {
+        Some(false)
+    } else if within(-last, -first) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The profile run backwards, `c(-t)`: knots negated and reversed, controls
+/// reversed.
+fn reversed_profile(knots: &[f64], controls: &[[f64; 4]]) -> (Vec<f64>, Vec<[f64; 4]>) {
+    (
+        knots.iter().rev().map(|knot| -knot).collect(),
+        controls.iter().rev().copied().collect(),
+    )
+}
+
+/// A profile turned about an axis (`rot_spl_sur`), as an exact rational
+/// spline: each profile control point sweeps a circular arc of at most a
+/// quarter turn per span. `v` is the angle, turned right-handed about the
+/// axis direction; the arc spans meet it exactly at their ends only, and
+/// between them the angle is close.
+fn decode_revolved_surface(
+    document: &SatDocument,
+    source: &[SatToken],
+) -> Option<SatBSplineSurface> {
+    let tokens = scalar_tokens(source);
+    let name = tokens
+        .iter()
+        .position(|t| t.as_ident() == Some("rot_spl_sur"))?;
+    // Only a spline profile, saved forward: `intcurve F { ... }`.
+    let curve = (name + 1..tokens.len()).find(|&i| tokens[i].as_ident().is_some())?;
+    if tokens[curve].as_ident() != Some("intcurve")
+        || matches!(tokens.get(curve + 1)?.as_ident(), Some("T" | "reversed"))
+    {
+        return None;
+    }
+    let open = (curve + 1..=curve + 2)
+        .find(|&i| tokens.get(i).and_then(SatToken::as_ident) == Some("{"))?;
+    let close = block_close(&tokens, open)?;
+    let profile = scalar_tokens(subtype_definition(document, &tokens, open)?);
+    let (degree_u, knots, controls) = decode_bspline_curve(&profile)?;
+    let closed = profile
+        .iter()
+        .position(|t| matches!(t.as_ident(), Some("nubs" | "nurbs")))
+        .and_then(|start| profile.get(start + 2))
+        .is_some_and(|form| {
+            matches!(form.as_ident(), Some("closed" | "periodic"))
+                || form.as_integer().is_some_and(|value| value != 0)
+        });
+    // The profile's own interval: `I` unset, or `F` and a bound, per end.
+    let mut index = close + 1;
+    for _ in 0..2 {
+        index += if tokens.get(index)?.as_ident()? == "I" {
+            1
+        } else {
+            2
+        };
+    }
+    let read3 = |i: usize| -> Option<[f64; 3]> {
+        Some([
+            tokens.get(i)?.as_float()?,
+            tokens.get(i + 1)?.as_float()?,
+            tokens.get(i + 2)?.as_float()?,
+        ])
+    };
+    let root = read3(index)?;
+    let axis = read3(index + 3)?;
+    // Level 2 saves only the ranges; a fitted spline (level 0) is read by
+    // the caller instead.
+    let range = index + 6;
+    if tokens.get(range)?.as_integer()? != 2 {
+        return None;
+    }
+    let mut bounds = [0.0; 4];
+    for (slot, bound) in bounds.iter_mut().enumerate() {
+        if tokens.get(range + 1 + slot * 2)?.as_float().is_some() {
+            return None;
+        }
+        *bound = tokens.get(range + 2 + slot * 2)?.as_float()?;
+    }
+    let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    let sweep = bounds[3] - bounds[2];
+    if !bounds
+        .iter()
+        .chain(root.iter())
+        .chain(axis.iter())
+        .all(|value| value.is_finite())
+        || length < 1e-12
+        || !(sweep > 0.0 && sweep <= 2.0 * std::f64::consts::PI + 1e-9)
+    {
+        return None;
+    }
+    let axis = [axis[0] / length, axis[1] / length, axis[2] / length];
+
+    let (u_knots, controls) = if runs_against_profile(degree_u, &knots, bounds[0], bounds[1])? {
+        reversed_profile(&knots, &controls)
+    } else {
+        (knots, controls)
+    };
+
+    let spans = (sweep / std::f64::consts::FRAC_PI_2 - 1e-9).ceil().max(1.0) as usize;
+    let step = sweep / spans as f64;
+    let mid_weight = (step / 2.0).cos();
+    let mut v_knots = vec![bounds[2]; 3];
+    for span in 1..spans {
+        let knot = bounds[2] + sweep * span as f64 / spans as f64;
+        v_knots.extend([knot, knot]);
+    }
+    v_knots.extend([bounds[3]; 3]);
+    // (angle, radius scale, weight) of each control row.
+    let mut rows = vec![(bounds[2], 1.0, 1.0)];
+    for span in 0..spans {
+        let start = bounds[2] + step * span as f64;
+        rows.push((start + step / 2.0, 1.0 / mid_weight, mid_weight));
+        rows.push((start + step, 1.0, 1.0));
+    }
+
+    let control_count_u = controls.len();
+    let mut control_points = Vec::with_capacity(control_count_u * rows.len());
+    for &(angle, scale, row_weight) in &rows {
+        let (sin, cos) = angle.sin_cos();
+        for p in &controls {
+            let w = p[3];
+            let point = [p[0] / w - root[0], p[1] / w - root[1], p[2] / w - root[2]];
+            let along = point[0] * axis[0] + point[1] * axis[1] + point[2] * axis[2];
+            let x = [
+                point[0] - axis[0] * along,
+                point[1] - axis[1] * along,
+                point[2] - axis[2] * along,
+            ];
+            let y = [
+                axis[1] * x[2] - axis[2] * x[1],
+                axis[2] * x[0] - axis[0] * x[2],
+                axis[0] * x[1] - axis[1] * x[0],
+            ];
+            let weight = w * row_weight;
+            let mut homogeneous = [0.0; 4];
+            for c in 0..3 {
+                let at = root[c] + axis[c] * along + scale * (x[c] * cos + y[c] * sin);
+                homogeneous[c] = at * weight;
+            }
+            homogeneous[3] = weight;
+            control_points.push(homogeneous);
+        }
+    }
+    let form = if closed { "closed" } else { "open" };
+    let full_turn = (sweep - 2.0 * std::f64::consts::PI).abs() < 1e-9;
+    Some(SatBSplineSurface {
+        rational: true,
+        degree_u,
+        degree_v: 2,
+        u_closure: Some(form.into()),
+        v_closure: Some(if full_turn { "closed" } else { "open" }.into()),
+        u_singularity: None,
+        v_singularity: None,
+        u_knots,
+        v_knots,
+        control_count_u,
+        control_count_v: rows.len(),
+        control_points,
+        fit_tolerance: Some(0.0),
+    })
+}
+
 /// A spline plus a straight curve is an exact tensor-product ruled surface.
 /// ACIS defines S(u,v) = C(u) + line(v) - origin; no fitting is required.
 fn decode_linear_sum_surface(source: &[SatToken]) -> Option<SatBSplineSurface> {
@@ -2241,6 +2434,12 @@ fn decode_linear_sum_surface(source: &[SatToken]) -> Option<SatBSplineSurface> {
     {
         return None;
     }
+    let (u_knots, controls) =
+        if runs_against_profile(degree_u, &u_knots, bounds[0], bounds[1]) == Some(true) {
+            reversed_profile(&u_knots, &controls)
+        } else {
+            (u_knots, controls)
+        };
     let control_count_u = controls.len();
     let mut control_points = Vec::with_capacity(control_count_u * 2);
     for v in [bounds[2], bounds[3]] {
@@ -2758,7 +2957,79 @@ pub struct SatDocument {
     /// SAT file header.
     pub header: SatHeader,
     /// Entity records in the document.
+    ///
+    /// Shared subtype definitions are looked up through an index built on
+    /// first use. It is rebuilt when the record list changes length or
+    /// allocation and dropped by every `&mut self` method; a subtype block
+    /// added or removed inside an existing record should be edited through
+    /// [`SatDocument::record_mut`], not through this field in place.
     pub records: Vec<SatRecord>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    subtypes: SubtypeIndex,
+}
+
+/// Where each shared subtype definition starts: definition number to
+/// `(record position, token position of its opening brace)`, plus the shape
+/// of the record list it was built from.
+#[derive(Default)]
+struct SubtypeIndex(std::sync::RwLock<Option<SubtypeEntries>>);
+
+struct SubtypeEntries {
+    records_len: usize,
+    records_ptr: usize,
+    starts: Vec<(u32, u32)>,
+}
+
+impl SubtypeIndex {
+    fn clear(&mut self) {
+        *self.0.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+// A cache, not content: copies start empty, and it never makes two
+// documents differ.
+impl Clone for SubtypeIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for SubtypeIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl fmt::Debug for SubtypeIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SubtypeIndex")
+    }
+}
+
+/// Whether `tokens[at]` opens a subtype definition: a `{` that is not a
+/// `{ ref n }` reference.
+fn opens_subtype_definition(tokens: &[SatToken], at: usize) -> bool {
+    tokens[at].as_ident() == Some("{")
+        && tokens.get(at + 1).and_then(SatToken::as_ident) != Some("ref")
+}
+
+/// The definition body whose `{` is `tokens[start]`: the tokens up to its
+/// matching `}`, without the braces. `None` when it is never closed.
+fn subtype_body(tokens: &[SatToken], start: usize) -> Option<&[SatToken]> {
+    let mut depth = 1usize;
+    for end in start + 1..tokens.len() {
+        match tokens[end].as_ident() {
+            Some("{") => depth += 1,
+            Some("}") => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&tokens[start + 1..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(super) fn transform_flags(matrix: [[f64; 3]; 3], scale: f64) -> [&'static str; 3] {
@@ -2777,17 +3048,20 @@ pub(super) fn transform_flags(matrix: [[f64; 3]; 3], scale: f64) -> [&'static st
 impl SatDocument {
     /// Creates a new empty SAT document with ACIS 7.0 header.
     pub fn new() -> Self {
-        Self {
-            header: SatHeader::new(),
-            records: Vec::new(),
-        }
+        Self::with_header(SatHeader::new())
     }
 
     /// Creates a document with the specified header.
     pub fn with_header(header: SatHeader) -> Self {
+        Self::with_records(header, Vec::new())
+    }
+
+    /// Creates a document from a header and its records.
+    pub fn with_records(header: SatHeader, records: Vec<SatRecord>) -> Self {
         Self {
             header,
-            records: Vec::new(),
+            records,
+            subtypes: SubtypeIndex::default(),
         }
     }
 
@@ -2858,6 +3132,7 @@ impl SatDocument {
     /// body's transform pointer) when absent. Encodes the 3×3, translation and
     /// scale in the layout `placement()` reads back.
     pub fn set_placement(&mut self, matrix: [[f64; 3]; 3], translation: [f64; 3], scale: f64) {
+        self.subtypes.clear();
         let mut tokens = Vec::with_capacity(17);
         tokens.push(SatToken::Pointer(SatPointer::NULL)); // v700 book-keeping
         for row in &matrix {
@@ -2932,6 +3207,7 @@ impl SatDocument {
 
     /// Returns a mutable record by index.
     pub fn record_mut(&mut self, index: usize) -> Option<&mut SatRecord> {
+        self.subtypes.clear();
         if matches!(self.records.get(index), Some(r) if r.index == index as i32) {
             return self.records.get_mut(index);
         }
@@ -3012,6 +3288,7 @@ impl SatDocument {
 
     /// Adds a record and returns its index.
     pub fn add_record(&mut self, mut record: SatRecord) -> i32 {
+        self.subtypes.clear();
         let index = self.records.len() as i32;
         record.index = index;
         self.records.push(record);
@@ -3034,31 +3311,80 @@ impl SatDocument {
     /// `{ ref n }` blocks reference an earlier definition and do not consume
     /// an index of their own. The returned slice excludes the surrounding
     /// braces but includes the subtype identifier and its complete payload.
+    ///
+    /// Every reference used to rescan the document from its first record, so
+    /// a body resolving one reference per face cost faces x records. The
+    /// definitions' positions are now indexed once (see [`Self::records`]);
+    /// a lookup checks that its position still opens a definition and falls
+    /// back to the scan when it does not.
     pub fn subtype_tokens(&self, requested: usize) -> Option<&[SatToken]> {
+        match self.indexed_subtype(requested) {
+            Ok(Some((record, at))) => subtype_body(&self.records[record].tokens, at),
+            Ok(None) => None,
+            Err(()) => self.scan_subtype_tokens(requested),
+        }
+    }
+
+    /// The indexed `(record, token)` of definition `requested`, building the
+    /// index when it is missing or was built from another record list.
+    /// `Ok(None)` when there is no such definition; `Err` when the index
+    /// cannot answer (the caller then scans).
+    fn indexed_subtype(&self, requested: usize) -> Result<Option<(usize, usize)>, ()> {
+        let shape = (self.records.len(), self.records.as_ptr() as usize);
+        let lookup = |entries: &SubtypeEntries| {
+            if (entries.records_len, entries.records_ptr) != shape {
+                return Err(());
+            }
+            let Some(&(record, at)) = entries.starts.get(requested) else {
+                return Ok(None);
+            };
+            let (record, at) = (record as usize, at as usize);
+            match self.records.get(record) {
+                Some(r) if at < r.tokens.len() && opens_subtype_definition(&r.tokens, at) => {
+                    Ok(Some((record, at)))
+                }
+                _ => Err(()),
+            }
+        };
+        {
+            let guard = self.subtypes.0.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(entries) = guard.as_ref() {
+                if let Ok(found) = lookup(entries) {
+                    return Ok(found);
+                }
+            }
+        }
+        let mut guard = self.subtypes.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut starts = Vec::new();
+        for (record, r) in self.records.iter().enumerate() {
+            for at in 0..r.tokens.len() {
+                if opens_subtype_definition(&r.tokens, at) {
+                    let record = u32::try_from(record).map_err(|_| ())?;
+                    let at = u32::try_from(at).map_err(|_| ())?;
+                    starts.push((record, at));
+                }
+            }
+        }
+        let entries = guard.insert(SubtypeEntries {
+            records_len: shape.0,
+            records_ptr: shape.1,
+            starts,
+        });
+        lookup(entries)
+    }
+
+    /// The definition found by walking every record in order: what the index
+    /// replaces, kept for a lookup the index cannot answer.
+    fn scan_subtype_tokens(&self, requested: usize) -> Option<&[SatToken]> {
         let mut current = 0usize;
         for record in &self.records {
             let tokens = &record.tokens;
             for start in 0..tokens.len() {
-                if tokens[start].as_ident() != Some("{")
-                    || tokens.get(start + 1).and_then(SatToken::as_ident) == Some("ref")
-                {
+                if !opens_subtype_definition(tokens, start) {
                     continue;
                 }
                 if current == requested {
-                    let mut depth = 1usize;
-                    for end in start + 1..tokens.len() {
-                        match tokens[end].as_ident() {
-                            Some("{") => depth += 1,
-                            Some("}") => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    return Some(&tokens[start + 1..end]);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    return None;
+                    return subtype_body(tokens, start);
                 }
                 current += 1;
             }
@@ -3113,6 +3439,7 @@ impl SatDocument {
     /// Preserve existing non-null links.
     pub fn complete_brep_links(&mut self) {
         use std::collections::HashMap;
+        self.subtypes.clear();
 
         let mut vertex_edges = HashMap::<i32, i32>::new();
         let mut edge_coedges = HashMap::<i32, i32>::new();
@@ -3164,6 +3491,7 @@ impl SatDocument {
     /// stay: the modeler's own binary data carries them, and they are what
     /// gives a face a colour of its own.
     pub fn strip_for_sab(&mut self) {
+        self.subtypes.clear();
         // Determine which records to keep.
         // Core ACIS base types (last segment after hyphen split):
         let keep: Vec<bool> = self
@@ -3383,6 +3711,7 @@ impl SatDocument {
     }
 
     fn bodies_first(&mut self) {
+        self.subtypes.clear();
         let mut order: Vec<usize> = (0..self.records.len()).collect();
         order.sort_by_key(|&at| self.records[at].entity_type != "body");
         let mut index_map = vec![-1i32; order.len()];
@@ -3588,6 +3917,244 @@ pub fn classify_entity_type(entity_type: &str) -> SatEntityCategory {
 /// For example, `tcoedge-coedge` derives from `coedge`.
 pub fn base_entity_type(entity_type: &str) -> &str {
     entity_type.rsplit('-').next().unwrap_or(entity_type)
+}
+
+#[cfg(test)]
+mod subtype_index_tests {
+    use super::*;
+
+    /// The lookup as it was before the index: a walk from the first record.
+    /// Kept verbatim as the reference the index must agree with.
+    fn reference_scan(doc: &SatDocument, requested: usize) -> Option<&[SatToken]> {
+        let mut current = 0usize;
+        for record in &doc.records {
+            let tokens = &record.tokens;
+            for start in 0..tokens.len() {
+                if tokens[start].as_ident() != Some("{")
+                    || tokens.get(start + 1).and_then(SatToken::as_ident) == Some("ref")
+                {
+                    continue;
+                }
+                if current == requested {
+                    let mut depth = 1usize;
+                    for end in start + 1..tokens.len() {
+                        match tokens[end].as_ident() {
+                            Some("{") => depth += 1,
+                            Some("}") => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return Some(&tokens[start + 1..end]);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    return None;
+                }
+                current += 1;
+            }
+        }
+        None
+    }
+
+    /// A small deterministic generator, so every run builds the same document.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    #[derive(Default)]
+    struct Census {
+        definitions: usize,
+        nested: usize,
+        references: usize,
+        binary_braces: usize,
+    }
+
+    /// `{` and `}` as text identifiers or as binary tags, as both readers
+    /// produce them.
+    fn brace(open: bool, rng: &mut Lcg, census: &mut Census) -> SatToken {
+        if rng.next(2) == 0 {
+            SatToken::Ident(if open { "{" } else { "}" }.to_string())
+        } else {
+            census.binary_braces += 1;
+            SatToken::Sab {
+                tag: if open { 0x0F } else { 0x10 },
+                data: Vec::new(),
+            }
+        }
+    }
+
+    /// One definition, sometimes holding a nested one or a reference to an
+    /// earlier definition (references consume no number).
+    fn definition(rng: &mut Lcg, census: &mut Census, out: &mut Vec<SatToken>) {
+        out.push(brace(true, rng, census));
+        census.definitions += 1;
+        out.push(SatToken::Ident(format!("kind{}", rng.next(7))));
+        out.push(SatToken::Float(rng.next(1000) as f64 / 7.0));
+        match rng.next(4) {
+            0 => {
+                census.nested += 1;
+                definition(rng, census, out);
+            }
+            1 if census.definitions > 1 => {
+                census.references += 1;
+                out.push(brace(true, rng, census));
+                out.push(SatToken::Ident("ref".to_string()));
+                out.push(SatToken::Integer(
+                    rng.next(census.definitions as u64 - 1) as i64
+                ));
+                out.push(brace(false, rng, census));
+            }
+            _ => {}
+        }
+        out.push(SatToken::Integer(rng.next(100) as i64));
+        out.push(brace(false, rng, census));
+    }
+
+    fn record(at: usize, tokens: Vec<SatToken>) -> SatRecord {
+        let mut r = SatRecord::new(at as i32, "spline-surface");
+        r.tokens = tokens;
+        r
+    }
+
+    /// Hundreds of records with zero to three definitions or references each,
+    /// and a last record whose definition never closes.
+    fn document(census: &mut Census) -> SatDocument {
+        let mut rng = Lcg(2224);
+        let mut doc = SatDocument::new();
+        for at in 0..400 {
+            let mut tokens = vec![SatToken::Pointer(SatPointer::NULL)];
+            for _ in 0..rng.next(4) {
+                if rng.next(5) == 0 && census.definitions > 0 {
+                    census.references += 1;
+                    tokens.push(brace(true, &mut rng, census));
+                    tokens.push(SatToken::Ident("ref".to_string()));
+                    tokens.push(SatToken::Integer(rng.next(census.definitions as u64) as i64));
+                    tokens.push(brace(false, &mut rng, census));
+                } else {
+                    definition(&mut rng, census, &mut tokens);
+                }
+                tokens.push(SatToken::Enum("forward".to_string()));
+            }
+            tokens.push(SatToken::Terminator);
+            doc.records.push(record(at, tokens));
+        }
+        let open = brace(true, &mut rng, census);
+        census.definitions += 1;
+        doc.records.push(record(
+            400,
+            vec![open, SatToken::Ident("unclosed".to_string())],
+        ));
+        doc
+    }
+
+    fn assert_agrees(doc: &SatDocument, definitions: usize, when: &str) {
+        for n in 0..definitions + 8 {
+            assert_eq!(
+                doc.subtype_tokens(n),
+                reference_scan(doc, n),
+                "definition {n} {when}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_lookup_returns_what_the_scan_returns() {
+        let mut census = Census::default();
+        let doc = document(&mut census);
+        // The document exercises what the lookup has to get right.
+        assert!(
+            census.definitions > 300,
+            "{} definitions",
+            census.definitions
+        );
+        assert!(census.nested > 50, "{} nested", census.nested);
+        assert!(census.references > 100, "{} references", census.references);
+        assert!(
+            census.binary_braces > 300,
+            "{} binary braces",
+            census.binary_braces
+        );
+        assert!(
+            reference_scan(&doc, census.definitions - 1).is_none(),
+            "unclosed last"
+        );
+        assert!(reference_scan(&doc, census.definitions - 2).is_some());
+
+        assert_agrees(&doc, census.definitions, "");
+        // Every lookup was answered by the index, none by the fallback scan.
+        for n in 0..census.definitions + 8 {
+            let indexed = doc.indexed_subtype(n);
+            assert!(indexed.is_ok(), "definition {n} fell back to the scan");
+            assert_eq!(indexed.unwrap().is_some(), n < census.definitions);
+        }
+        // Out of order too: the index does not depend on the order of use.
+        let mut rng = Lcg(7);
+        for _ in 0..2000 {
+            let n = rng.next(census.definitions as u64 + 8) as usize;
+            assert_eq!(
+                doc.subtype_tokens(n),
+                reference_scan(&doc, n),
+                "definition {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_lookup_follows_edits_of_the_records() {
+        let mut census = Census::default();
+        let mut doc = document(&mut census);
+        let mut definitions = census.definitions;
+        assert_agrees(&doc, definitions, "before edits");
+
+        // A definition inserted in front of every other one renumbers them all.
+        let mut rng = Lcg(11);
+        let mut inserted = Vec::new();
+        definition(&mut rng, &mut Census::default(), &mut inserted);
+        let added = inserted
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| opens_subtype_definition(&inserted, *at))
+            .count();
+        let first = doc.record_mut(0).unwrap();
+        first.tokens.splice(1..1, inserted).for_each(drop);
+        definitions += added;
+        assert_agrees(&doc, definitions, "after record_mut");
+
+        // Records pushed straight onto the field.
+        let mut tokens = Vec::new();
+        definition(&mut rng, &mut Census::default(), &mut tokens);
+        definitions += tokens
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| opens_subtype_definition(&tokens, *at))
+            .count();
+        let at = doc.records.len();
+        doc.records.push(record(at, tokens));
+        assert_agrees(&doc, definitions, "after a push");
+
+        // The record list replaced, here by its own first half.
+        // (`definitions` stays an upper bound: past the end both answer None.)
+        let half: Vec<SatRecord> = doc.records[..200].to_vec();
+        doc.records = half;
+        assert!(
+            reference_scan(&doc, definitions * 3 / 4).is_none(),
+            "fewer definitions now"
+        );
+        assert_agrees(&doc, definitions, "after replacing the records");
+
+        // A copy answers alike and does not share the original's index.
+        let copy = doc.clone();
+        assert_eq!(copy, doc);
+        assert_agrees(&copy, definitions, "in a copy");
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]

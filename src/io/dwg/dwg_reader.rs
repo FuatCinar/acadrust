@@ -34,13 +34,14 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::error::DxfError;
-use crate::io::dwg::checksum::{apply_magic_sequence, apply_mask};
+use crate::io::dwg::checksum::{adler32_checksum, apply_magic_sequence, apply_mask};
 use crate::io::dwg::decompressor_ac18::decompress_ac18;
 use crate::io::dwg::decompressor_ac21::decompress_ac21;
 use crate::io::dwg::dwg21_metadata::Dwg21CompressedMetadata;
 use crate::io::dwg::dwg_version::DwgVersion;
 use crate::io::dwg::parallel::{map_ordered, worker_count};
 use crate::io::dwg::reed_solomon::reed_solomon_decode;
+use crate::io::dwg::shard_plan::ShardState;
 use crate::io::dwg::size_limits::{
     size_from_file, try_vec_with_capacity, try_zeroed_vec, MAX_DATA_PAGE_SIZE, MAX_SECTION_SIZE,
     MAX_SYSTEM_PAGE_SIZE,
@@ -145,9 +146,15 @@ fn decode_ac21_page(
     block_size: usize,
     compressed_size: u64,
     uncompressed_size: u64,
+    decryption_key: Option<&[u8]>,
 ) -> Result<Vec<u8>, DxfError> {
     let mut compressed_data = try_zeroed_vec(total_size, "AC21 compressed page data")?;
     reed_solomon_decode(encoded, &mut compressed_data, factor, block_size);
+    if let Some(key) = decryption_key {
+        let mut rc4 = crate::io::dwg::security::Rc4::new(key);
+        let decrypt_len = (compressed_size as usize).min(compressed_data.len());
+        rc4.apply(&mut compressed_data[..decrypt_len]);
+    }
     if compressed_size == uncompressed_size {
         compressed_data.truncate(uncompressed_size as usize);
         return Ok(compressed_data);
@@ -312,6 +319,35 @@ pub struct DwgReadOptions {
     /// starts. `None` keeps the previous per-section behaviour.
     #[cfg_attr(feature = "serde", serde(default))]
     pub max_decompressed_bytes: Option<usize>,
+    /// Optional password for decrypting password-protected DWG files.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub password: Option<String>,
+    /// When `true`, attaching an AcDs modeler blob does not parse it to derive
+    /// the entity's `point_of_reference`; that parse is most of the attach
+    /// cost on a drawing with many solids.
+    ///
+    /// The default (`false`) derives the point at load time, as before. When
+    /// set, a solid, region or body whose file stored no wireframe anchor keeps
+    /// `point_of_reference` at the origin and is flagged
+    /// (`AcisData::reference_point_deferred`); `reference_point()` on the
+    /// entity derives the point on request, and moving or transforming the
+    /// entity derives it first. A DWG written back from such a document omits
+    /// the derived anchor that an eager read would have written (the
+    /// wireframe point of a pre-R2013 save, and the inline cache a point
+    /// forces). The DXF reader always derives eagerly.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub defer_solid_reference_point: bool,
+    /// When `true`, entities are read without the verbatim bytes a DWG save
+    /// copies for an unedited entity: `EntityCommon::raw_record`, and the raw
+    /// EED of every XDATA block that decoded into a record. That saves memory
+    /// for read-only use. The model is the same; a DWG written from the
+    /// document re-encodes those entities and their XDATA records instead of
+    /// copying the source bytes. Objects keep their raw data.
+    ///
+    /// The default (`false`) keeps the bytes, so an unedited entity is saved
+    /// byte for byte.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skip_roundtrip_data: bool,
 }
 
 impl Default for DwgReadOptions {
@@ -321,6 +357,9 @@ impl Default for DwgReadOptions {
             max_mesh_faces: None,
             max_mesh_face_indices: None,
             max_decompressed_bytes: None,
+            password: None,
+            defer_solid_reference_point: false,
+            skip_roundtrip_data: false,
         }
     }
 }
@@ -355,6 +394,26 @@ impl DwgReadOptions {
         self
     }
 
+    /// Set a password for decrypting password-protected DWG files.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Skip deriving the reference point of AcDs-backed solids at load time
+    /// (see [`Self::defer_solid_reference_point`]).
+    pub fn with_deferred_solid_reference_point(mut self) -> Self {
+        self.defer_solid_reference_point = true;
+        self
+    }
+
+    /// Read without the bytes kept for a byte-exact re-save
+    /// (see [`Self::skip_roundtrip_data`]).
+    pub fn without_roundtrip_data(mut self) -> Self {
+        self.skip_roundtrip_data = true;
+        self
+    }
+
     /// Budget applied while reading MESH entities.
     pub fn mesh_budget(&self) -> crate::io::dwg::mesh_budget::MeshFaceBudget {
         crate::io::dwg::mesh_budget::MeshFaceBudget::from_system()
@@ -367,7 +426,10 @@ fn find_subsequence(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    (from..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+    if from > haystack.len() - needle.len() {
+        return None;
+    }
+    memchr::memmem::find(&haystack[from..], needle).map(|i| from + i)
 }
 
 /// First index `>= from` where a SAB blob header magic begins — either
@@ -378,15 +440,20 @@ fn find_subsequence(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize
 fn find_acds_magic(buf: &[u8], from: usize) -> Option<usize> {
     const ACIS_MAGIC: &[u8] = b"ACIS BinaryFile";
     const ASM_MAGIC: &[u8] = b"ASM BinaryFile";
-    let mut i = from;
-    while i < buf.len() {
-        if buf[i] == b'A' {
-            let rest = &buf[i..];
-            if rest.starts_with(ACIS_MAGIC) || rest.starts_with(ASM_MAGIC) {
-                return Some(i);
+    // Both magics end in " BinaryFile": find that with memchr, then check
+    // which magic it closes.
+    const TAIL: &[u8] = b" BinaryFile";
+    let finder = memchr::memmem::Finder::new(TAIL);
+    let mut at = from;
+    while at < buf.len() {
+        let hit = at + finder.find(&buf[at..])?;
+        for magic in [ACIS_MAGIC, ASM_MAGIC] {
+            let head = magic.len() - TAIL.len();
+            if hit >= from + head && buf[hit - head..].starts_with(magic) {
+                return Some(hit - head);
             }
         }
-        i += 1;
+        at = hit + 1;
     }
     None
 }
@@ -435,6 +502,8 @@ fn find_acds_end(buf: &[u8], from: usize, to: usize) -> Option<(usize, usize)> {
 /// blob therefore lives in `[base + off[r] .. base + off[r+1]]`; locate the SAB
 /// header there and read through its end marker (which can run a few bytes past
 /// `off[r+1]`). Records with an empty range carry no geometry and are skipped.
+/// A record whose range holds a blob reference instead of a body is followed to
+/// its `blob01` pages ([`resolve_acds_blob_ref`]).
 /// Empty when there is no such table (the caller then falls back to order-based
 /// attachment).
 fn extract_acds_record_blobs(buf: &[u8], modeler_handles: &HashSet<u64>) -> Vec<(u64, Vec<u8>)> {
@@ -448,10 +517,12 @@ fn extract_acds_record_blobs(buf: &[u8], modeler_handles: &HashSet<u64>) -> Vec<
     // unclaimed blob segments elsewhere in the datastore. Kept in record order.
     let mut orphan_handles: Vec<u64> = Vec::new();
     let mut claimed_starts: HashSet<usize> = HashSet::new();
+    // `blob01` segments by id, collected on the first record that needs them.
+    let mut blob01_pages: Option<HashMap<u32, usize>> = None;
     // A large datastore splits its records across several `_data_` segments, so
     // process every one whose content is a record table (opens with `col0=0x14`).
     let mut scan = 0;
-    while let Some(i) = buf[scan..].windows(8).position(|w| w == marker) {
+    while let Some(i) = memchr::memmem::find(&buf[scan..], &marker) {
         let seg = scan + i;
         scan = seg + 8;
         if rd(seg + 48) != Some(0x14) {
@@ -494,12 +565,16 @@ fn extract_acds_record_blobs(buf: &[u8], modeler_handles: &HashSet<u64>) -> Vec<
                 continue;
             }
             let region = &buf[region_start..region_end.min(seg_end)];
-            let Some(mp) = region
-                .windows(14)
-                .position(|w| w == b"ASM BinaryFile")
-                .or_else(|| region.windows(15).position(|w| w == b"ACIS BinaryFile"))
+            let Some(mp) = memchr::memmem::find(region, b"ASM BinaryFile")
+                .or_else(|| memchr::memmem::find(region, b"ACIS BinaryFile"))
             else {
-                if modeler_handles.contains(&handle) {
+                // A body too large for the table's own data is stored in `blob01`
+                // pages; the record then holds a reference naming them.
+                let pages = blob01_pages.get_or_insert_with(|| acds_blob01_pages(buf));
+                if let Some((start, blob)) = resolve_acds_blob_ref(buf, region, pages) {
+                    claimed_starts.insert(start);
+                    out.push((handle, blob));
+                } else if modeler_handles.contains(&handle) {
                     orphan_handles.push(handle); // blob lives in an external segment
                 }
                 continue;
@@ -532,6 +607,99 @@ fn extract_acds_record_blobs(buf: &[u8], modeler_handles: &HashSet<u64>) -> Vec<
         }
     }
     out
+}
+
+/// Size of a `blob01` page frame: the 48-byte segment header, then
+/// `total_data_size` (u64), `page_start_offset` (u64), `page_index` (u32),
+/// `page_count` (u32) and `page_data_size` (u64). The page's data follows.
+const BLOB01_FRAME_LEN: usize = 80;
+
+/// Every `blob01` segment in an AcDs buffer, by its segment id (the u32 at
+/// header offset 8), for [`resolve_acds_blob_ref`]. Only headers flagged as a
+/// blob page (`is_blob01`, the u32 at offset 12, is 1) are taken.
+fn acds_blob01_pages(buf: &[u8]) -> HashMap<u32, usize> {
+    const MARKER: &[u8] = b"\xAC\xD5blob01";
+    let mut pages = HashMap::new();
+    let mut scan = 0usize;
+    while let Some(i) = buf[scan..].windows(MARKER.len()).position(|w| w == MARKER) {
+        let seg = scan + i;
+        scan = seg + MARKER.len();
+        let word = |p: usize| {
+            buf.get(p..p + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        if let (Some(id), Some(1)) = (word(seg + 8), word(seg + 12)) {
+            pages.entry(id).or_insert(seg);
+        }
+    }
+    pages
+}
+
+/// The body a `_data_` record stores out of line, from its blob reference.
+///
+/// A record whose data does not fit its `_data_` segment holds, in place of
+/// the data, a reference to the `blob01` pages that do. Its layout, as found
+/// in AutoCAD-saved datastores: a u32 marker, `total_data_size` (u64),
+/// `page_count` (u32), the reference's size after the marker (u32,
+/// `32 + 8 * page_count`),
+/// the page size and the last page's size (u32 each), two u32 left unread,
+/// then `page_count` pairs `(segment id, size)` (u32 each), in page order.
+///
+/// Every page must be a `blob01` segment whose own frame agrees with the
+/// reference: the same total, its index in the chain, the same page count and
+/// size; the sizes must add up to the total. The pages are joined and cut, as
+/// a body inside the table is, from its header magic through its end marker.
+/// Returns the buffer position of the magic (to mark the blob as claimed) and
+/// the body; `None` for anything else, which leaves the record an orphan.
+fn resolve_acds_blob_ref(
+    buf: &[u8],
+    region: &[u8],
+    pages: &HashMap<u32, usize>,
+) -> Option<(usize, Vec<u8>)> {
+    let r32 = |b: &[u8], p: usize| {
+        b.get(p..p + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+    };
+    let r64 = |b: &[u8], p: usize| {
+        b.get(p..p + 8)
+            .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+    };
+    let total = r64(region, 4)?;
+    let count = r32(region, 12)? as usize;
+    if count == 0 || r32(region, 16)? as usize != 32 + 8 * count || region.len() < 36 + 8 * count {
+        return None;
+    }
+    if total > buf.len() as u64 {
+        return None;
+    }
+    let mut body = Vec::with_capacity(total as usize);
+    // (offset in `body`, position in `buf`) of each page's data.
+    let mut starts = Vec::with_capacity(count);
+    for index in 0..count {
+        let id = r32(region, 36 + 8 * index)?;
+        let size = r32(region, 40 + 8 * index)? as usize;
+        let seg = *pages.get(&id)?;
+        let frame_agrees = r64(buf, seg + 48) == Some(total)
+            && r32(buf, seg + 64) == Some(index as u32)
+            && r32(buf, seg + 68) == Some(count as u32)
+            && r64(buf, seg + 72) == Some(size as u64);
+        if !frame_agrees {
+            return None;
+        }
+        let data = seg + BLOB01_FRAME_LEN;
+        starts.push((body.len(), data));
+        body.extend_from_slice(buf.get(data..data.checked_add(size)?)?);
+    }
+    if body.len() as u64 != total {
+        return None;
+    }
+    let magic = find_acds_magic(&body, 0)?;
+    let (end, marker_len) = find_acds_end(&body, magic, body.len())?;
+    let (page_offset, page_start) = *starts.iter().rev().find(|(offset, _)| *offset <= magic)?;
+    Some((
+        page_start + magic - page_offset,
+        body[magic..end + marker_len].to_vec(),
+    ))
 }
 
 /// Extract every SAB (ACIS/ASM binary) blob from a decompressed AcDs section, in
@@ -587,7 +755,7 @@ fn strip_acds_blob01_frames(blob: Vec<u8>) -> Vec<u8> {
     let mut clean = Vec::with_capacity(blob.len());
     let mut cursor = 0usize;
     let mut scan = 0usize;
-    while let Some(relative) = blob[scan..].windows(PREFIX.len()).position(|w| w == PREFIX) {
+    while let Some(relative) = memchr::memmem::find(&blob[scan..], PREFIX) {
         let start = scan + relative;
         let valid = start + FRAME_LEN <= blob.len()
             && blob.get(start + 12..start + 16) == Some(&1u32.to_le_bytes())
@@ -616,57 +784,45 @@ fn acds_fill(acis: &mut crate::entities::solid3d::AcisData, blob: Vec<u8>) {
     acis.version = crate::entities::solid3d::AcisVersion::Version2;
 }
 
+/// Derive a modeler entity's reference point from its freshly attached SAB, or,
+/// when `defer`, only flag it so `reference_point()` derives it on request
+/// (deriving parses the whole SAB). The inline wireframe anchor (bbox centre)
+/// is the preferred reference point; the SAB point bbox centre, else its
+/// placement translation, is used only when the file carried none.
+fn acds_reference_point(
+    point: &mut crate::types::Vector3,
+    acis: &mut crate::entities::solid3d::AcisData,
+    defer: bool,
+) {
+    if *point != crate::types::Vector3::ZERO {
+        return;
+    }
+    if defer {
+        acis.reference_point_deferred = true;
+    } else if let Some(p) = acis.reference_centre() {
+        *point = p;
+    }
+}
+
 /// Apply a SAB blob to a modeler entity, deriving its placement reference point
-/// now that the geometry is available. Returns false for non-modeler entities.
-fn acds_apply(entity: &mut crate::entities::EntityType, blob: Vec<u8>) -> bool {
+/// now that the geometry is available (unless `defer`, see
+/// [`acds_reference_point`]). Returns false for non-modeler entities.
+fn acds_apply(entity: &mut crate::entities::EntityType, blob: Vec<u8>, defer: bool) -> bool {
     use crate::entities::EntityType;
     match entity {
         EntityType::Solid3D(s) => {
             acds_fill(&mut s.acis_data, blob);
-            // The inline wireframe anchor (bbox centre) is the preferred
-            // reference point; fall back to the SAB placement translation
-            // only when the file carried none.
-            if s.point_of_reference == crate::types::Vector3::ZERO {
-                if let Some(p) = s
-                    .acis_data
-                    .geometry_centre()
-                    .or_else(|| s.acis_data.placement_origin())
-                {
-                    s.point_of_reference = p;
-                }
-            }
+            acds_reference_point(&mut s.point_of_reference, &mut s.acis_data, defer);
             true
         }
         EntityType::Region(r) => {
             acds_fill(&mut r.acis_data, blob);
-            // The inline wireframe anchor (bbox centre) is the preferred
-            // reference point; fall back to the SAB placement translation
-            // only when the file carried none.
-            if r.point_of_reference == crate::types::Vector3::ZERO {
-                if let Some(p) = r
-                    .acis_data
-                    .geometry_centre()
-                    .or_else(|| r.acis_data.placement_origin())
-                {
-                    r.point_of_reference = p;
-                }
-            }
+            acds_reference_point(&mut r.point_of_reference, &mut r.acis_data, defer);
             true
         }
         EntityType::Body(b) => {
             acds_fill(&mut b.acis_data, blob);
-            // The inline wireframe anchor (bbox centre) is the preferred
-            // reference point; fall back to the SAB placement translation
-            // only when the file carried none.
-            if b.point_of_reference == crate::types::Vector3::ZERO {
-                if let Some(p) = b
-                    .acis_data
-                    .geometry_centre()
-                    .or_else(|| b.acis_data.placement_origin())
-                {
-                    b.point_of_reference = p;
-                }
-            }
+            acds_reference_point(&mut b.point_of_reference, &mut b.acis_data, defer);
             true
         }
         EntityType::Surface(s) => {
@@ -683,17 +839,65 @@ fn acds_apply(entity: &mut crate::entities::EntityType, blob: Vec<u8>) -> bool {
 fn attach_acds_record_blobs(
     document: &mut crate::document::CadDocument,
     record_blobs: Vec<(u64, Vec<u8>)>,
+    defer: bool,
 ) -> usize {
     document.acis_sab_handles.clear();
+    // Cleaning a blob and finding its reference point parses the whole SAB,
+    // and the blobs are independent: do that for all of them in parallel,
+    // then hand the results to the document in record order.
+    let prepared = super::parallel::map_ordered(record_blobs, |(h, blob)| {
+        let mut acis = crate::entities::solid3d::AcisData::default();
+        acds_fill(&mut acis, blob);
+        // Deferred, the point is derived on request instead (see
+        // `acds_reference_point`), so the SAB is not parsed here.
+        let centre = if defer {
+            None
+        } else {
+            acis.geometry_centre().or_else(|| acis.placement_origin())
+        };
+        (h, acis, centre)
+    });
     let mut attached = 0usize;
-    for (h, blob) in record_blobs {
+    for (h, acis, centre) in prepared {
         if let Some(entity) = document.get_entity_mut(crate::Handle::new(h)) {
-            if acds_apply(entity, blob) {
+            if acds_apply_prepared(entity, acis, centre, defer) {
                 attached += 1;
             }
         }
     }
     attached
+}
+
+/// [`acds_apply`] with the blob already cleaned into `acis` and its reference
+/// point already found, so the expensive part can run off the document.
+fn acds_apply_prepared(
+    entity: &mut crate::entities::EntityType,
+    acis: crate::entities::solid3d::AcisData,
+    centre: Option<crate::types::Vector3>,
+    defer: bool,
+) -> bool {
+    use crate::entities::EntityType;
+    let (data, point) = match entity {
+        EntityType::Solid3D(s) => (&mut s.acis_data, Some(&mut s.point_of_reference)),
+        EntityType::Region(r) => (&mut r.acis_data, Some(&mut r.point_of_reference)),
+        EntityType::Body(b) => (&mut b.acis_data, Some(&mut b.point_of_reference)),
+        EntityType::Surface(s) => (&mut s.acis_data, None),
+        _ => return false,
+    };
+    data.sab_data = acis.sab_data;
+    data.sat_data = acis.sat_data;
+    data.is_binary = acis.is_binary;
+    data.version = acis.version;
+    if let Some(point) = point {
+        if *point == crate::types::Vector3::ZERO {
+            if defer {
+                data.reference_point_deferred = true;
+            } else if let Some(centre) = centre {
+                *point = centre;
+            }
+        }
+    }
+    true
 }
 
 /// Attach order-extracted AcDs SAB blobs when no record table is parseable: pair
@@ -702,6 +906,7 @@ fn attach_acds_record_blobs(
 fn attach_acds_sab_blobs(
     document: &mut crate::document::CadDocument,
     blobs: Vec<Vec<u8>>,
+    defer: bool,
 ) -> usize {
     use crate::entities::EntityType;
 
@@ -711,7 +916,7 @@ fn attach_acds_sab_blobs(
         let mut attached = 0usize;
         for (handle, blob) in ordered.into_iter().zip(blobs.into_iter()) {
             if let Some(entity) = document.get_entity_mut(handle) {
-                if acds_apply(entity, blob) {
+                if acds_apply(entity, blob, defer) {
                     attached += 1;
                 }
             }
@@ -732,7 +937,7 @@ fn attach_acds_sab_blobs(
                 | EntityType::Surface(_)
         ) {
             let Some(blob) = it.next() else { break };
-            if acds_apply(entity, blob) {
+            if acds_apply(entity, blob, defer) {
                 attached += 1;
             }
             continue;
@@ -931,6 +1136,10 @@ pub struct DwgReader<R: Read + Seek> {
     /// Decompressed bytes already charged against DwgReadOptions::max_decompressed_bytes in
     /// the current read.
     decompressed_bytes_used: usize,
+    /// State of a [`Self::read_sharded`] call between shards.
+    shard: Option<ShardState>,
+    /// Derived decryption key for password-protected drawings.
+    pub decryption_key: Option<Vec<u8>>,
 }
 
 impl DwgReader<File> {
@@ -956,6 +1165,8 @@ impl DwgReader<File> {
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
             decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         })
     }
 }
@@ -980,6 +1191,8 @@ impl DwgReader<Cursor<memmap2::Mmap>> {
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
             decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         })
     }
 }
@@ -1035,6 +1248,8 @@ impl<R: Read + Seek> DwgReader<R> {
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
             decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         }
     }
 
@@ -1050,6 +1265,8 @@ impl<R: Read + Seek> DwgReader<R> {
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
             decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         }
     }
 
@@ -1058,6 +1275,12 @@ impl<R: Read + Seek> DwgReader<R> {
     /// The callback may run from Rayon worker threads while object records are
     /// decoded, so it must be thread-safe and should only perform cheap atomic
     /// updates.
+    /// Set a password for decrypting password-protected DWG files.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.options.password = Some(password.into());
+        self
+    }
+
     pub fn set_progress_callback(&mut self, progress: std::sync::Arc<dyn Fn(u16) + Send + Sync>) {
         self.progress = Some(progress);
     }
@@ -1067,6 +1290,26 @@ impl<R: Read + Seek> DwgReader<R> {
         if let Some(progress) = &self.progress {
             progress(value.min(1000));
         }
+    }
+
+    /// Ensure the decryption key is derived and verified if the file is password-protected.
+    pub fn ensure_decryption_key(&mut self, info: &DwgFileHeaderInfo) -> Result<(), DxfError> {
+        if self.decryption_key.is_some() {
+            return Ok(());
+        }
+        if !info.section_descriptors.iter().any(|s| s.name == "AcDb:Security") {
+            return Ok(());
+        }
+        let sec_data = self.get_section_buffer("AcDb:Security", info)?;
+        let sec_info = crate::io::dwg::security::DwgSecurityInfo::parse(&sec_data)?;
+        let Some(pwd) = &self.options.password else {
+            return Err(DxfError::Decryption(
+                "Drawing is password protected; please provide a password".to_string(),
+            ));
+        };
+        let key = sec_info.derive_key(pwd)?;
+        self.decryption_key = Some(key);
+        Ok(())
     }
 
     /// Read the DWG file and reconstruct a `CadDocument`.
@@ -1082,6 +1325,27 @@ impl<R: Read + Seek> DwgReader<R> {
     /// document is returned instead of propagating the error.
     pub fn read(&mut self) -> std::result::Result<crate::document::CadDocument, DxfError> {
         self.read_with_stats().map(|outcome| outcome.document)
+    }
+
+    /// Tell the caller that a page's stored checksum does not match the
+    /// bytes read: the data was damaged after it was written.
+    fn check_page_checksum(
+        &mut self,
+        section: &str,
+        source_offset: Option<u64>,
+        stored: u32,
+        computed: u32,
+    ) {
+        if stored == computed {
+            return;
+        }
+        let message = format!(
+            "{section}: page checksum mismatch at offset {:#X} (stored {stored:#010X}, computed {computed:#010X})",
+            source_offset.unwrap_or(0)
+        );
+        self.notifications
+            .notify(NotificationType::Warning, message.clone());
+        self.report_section_diagnostic("checksum-mismatch", section, source_offset, message);
     }
 
     fn report_section_diagnostic(
@@ -1156,6 +1420,65 @@ impl<R: Read + Seek> DwgReader<R> {
         )
     }
 
+    /// Read the file in shards of at most `max_entities` model-space entity
+    /// records each, passing each shard's document to `each` before the next
+    /// shard is decoded, so only one shard's entities are held at a time.
+    ///
+    /// Every shard is a complete document with the header, classes, tables,
+    /// block records and non-entity objects of the whole file. Model-space
+    /// entities are divided between the shards in the order of the model
+    /// space entity list, and each stays in the same shard as its child
+    /// records (attributes, vertices, faces and sequence end); a shard holds
+    /// more than `max_entities` records only when one entity's children
+    /// exceed the limit. Block contents and paper-space entities are read
+    /// with the first shard.
+    ///
+    /// The handle map and the decompressed object section are read once and
+    /// shared by every shard. A drawing whose model space fits in one shard,
+    /// and a drawing older than R2004, is read as one shard, exactly as
+    /// [`Self::read_with_stats`] reads it.
+    ///
+    /// Returns the number of shards read. An error from `each` stops the read
+    /// and is returned.
+    ///
+    /// ```rust,no_run
+    /// use acadrust::DwgReader;
+    ///
+    /// # fn main() -> acadrust::Result<()> {
+    /// let mut reader = DwgReader::from_file("large.dwg")?;
+    /// let mut entities = 0;
+    /// let shards = reader.read_sharded(10_000, |shard| {
+    ///     entities += shard.document.model_space_entities().count();
+    ///     Ok(())
+    /// })?;
+    /// println!("{entities} model-space entities in {shards} shards");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_sharded<F>(
+        &mut self,
+        max_entities: usize,
+        mut each: F,
+    ) -> std::result::Result<usize, DxfError>
+    where
+        F: FnMut(crate::io::read::ReadOutcome) -> std::result::Result<(), DxfError>,
+    {
+        self.shard = Some(ShardState::new(max_entities));
+        let mut shards = 0;
+        let result = loop {
+            if let Err(error) = self.read_with_stats().and_then(&mut each) {
+                break Err(error);
+            }
+            shards += 1;
+            match self.shard.as_mut() {
+                Some(shard) if shard.index + 1 < shard.count() => shard.index += 1,
+                _ => break Ok(shards),
+            }
+        };
+        self.shard = None;
+        result
+    }
+
     fn read_with_optional_visitor(
         &mut self,
         visit: Option<
@@ -1197,12 +1520,13 @@ impl<R: Read + Seek> DwgReader<R> {
 
         // AC1009/R12 predates the section-map/object-stream model used by the
         // normal DWG reader. Dispatch it to the byte-aligned pre-R13 codec
-        // before attempting the R13+ file-header parser.
+        // before attempting the R13+ file-header parser. AC1006/R10 shares
+        // that layout and is read into an R11/R12 document.
         self.stream.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; 6];
         self.stream.read_exact(&mut magic)?;
         self.stream.seek(SeekFrom::Start(0))?;
-        if magic == *b"AC1009" || magic == *b"AD1009" {
+        if magic == *b"AC1009" || magic == *b"AD1009" || magic == *b"AC1006" {
             let mut bytes = Vec::new();
             self.stream.read_to_end(&mut bytes)?;
             let mut document = match crate::io::dwg::r12::read_document(
@@ -1231,7 +1555,9 @@ impl<R: Read + Seek> DwgReader<R> {
                         0,
                         0,
                         1,
-                        true,
+                        // The AC1009 read failed as a whole: nothing of
+                        // its record stream reached the document.
+                        false,
                         true,
                         false,
                         diagnostics,
@@ -1316,6 +1642,22 @@ impl<R: Read + Seek> DwgReader<R> {
                 info.page_records.len(),
             );
         }
+        if info.section_descriptors.iter().any(|s| s.name == "AcDb:Security") {
+            if let Err(e) = self.ensure_decryption_key(&info) {
+                if !self.options.failsafe {
+                    return Err(e);
+                }
+                report_read_error(
+                    &mut self.notifications,
+                    &mut diagnostics,
+                    "decryption-failed",
+                    ReadStage::FileHeader,
+                    Some("AcDb:Security"),
+                    format!("Failed to decrypt drawing: {}", e),
+                );
+            }
+        }
+
         let dxf_version = crate::types::DxfVersion::parse(&info.version_string)
             .unwrap_or(crate::types::DxfVersion::Unknown);
         self.report_progress(20);
@@ -1414,73 +1756,98 @@ impl<R: Read + Seek> DwgReader<R> {
         }
         self.report_progress(40);
 
-        // 4. Read Handle Map (AcDb:Handles)
-        let mut handles_section_read = false;
-        let handle_map = match self.get_section_buffer("AcDb:Handles", &info) {
-            Ok(handle_buf) => {
-                handles_section_read = true;
-                match crate::io::dwg::dwg_stream_readers::handle_reader::read_handles(&handle_buf) {
-                    Ok(mut hm) => {
-                        // AC15: Handle offsets are absolute file positions.
-                        // Convert to buffer-relative by subtracting the objects
-                        // section base offset.
-                        if info.objects_base_offset != 0 {
-                            let base = info.objects_base_offset;
-                            for offset in hm.values_mut() {
-                                *offset -= base;
+        // 4. Read Handle Map (AcDb:Handles). The later shards of a sharded
+        //    read reuse the handles and object section the first one read.
+        let resumed = self.shard.as_mut().and_then(ShardState::resume);
+        let mut handles_section_read = resumed.is_some();
+        let (cached_objects, handle_count, handle_map) = match resumed {
+            Some((objects, handle_count, handle_map)) => (Some(objects), handle_count, handle_map),
+            None => {
+                let handle_map = match self.get_section_buffer("AcDb:Handles", &info) {
+                    Ok(handle_buf) => {
+                        handles_section_read = true;
+                        match crate::io::dwg::dwg_stream_readers::handle_reader::read_handle_map(
+                            &handle_buf,
+                        ) {
+                            Ok(mut hm) => {
+                                // AC15: Handle offsets are absolute file positions.
+                                // Convert to buffer-relative by subtracting the objects
+                                // section base offset.
+                                if info.objects_base_offset != 0 {
+                                    let base = info.objects_base_offset;
+                                    for offset in hm.values_mut() {
+                                        *offset -= base;
+                                    }
+                                }
+                                hm
+                            }
+                            Err(e) => {
+                                report_read_error(
+                                    &mut self.notifications,
+                                    &mut diagnostics,
+                                    "handles-decode-failed",
+                                    ReadStage::Handles,
+                                    Some("AcDb:Handles"),
+                                    format!("Failed to read handles: {}", e),
+                                );
+                                Default::default()
                             }
                         }
-                        hm
                     }
                     Err(e) => {
                         report_read_error(
                             &mut self.notifications,
                             &mut diagnostics,
-                            "handles-decode-failed",
+                            "handles-extract-failed",
                             ReadStage::Handles,
                             Some("AcDb:Handles"),
-                            format!("Failed to read handles: {}", e),
+                            format!("Failed to extract handles section: {}", e),
                         );
-                        std::collections::HashMap::new()
+                        Default::default()
                     }
-                }
-            }
-            Err(e) => {
-                report_read_error(
-                    &mut self.notifications,
-                    &mut diagnostics,
-                    "handles-extract-failed",
-                    ReadStage::Handles,
-                    Some("AcDb:Handles"),
-                    format!("Failed to extract handles section: {}", e),
-                );
-                std::collections::HashMap::new()
+                };
+                (None, handle_map.len(), handle_map)
             }
         };
         self.report_progress(50);
 
         // 5. Read Objects (AcDb:AcDbObjects) and build document
-        let handle_count = handle_map.len();
         let mut objects_section_read = false;
         let mut record_stream_read = false;
         let mut decoded_source_records = 0usize;
         let mut skipped_source_records = 0usize;
         let objects_started = web_time::Instant::now();
         if !handle_map.is_empty() {
-            match self.get_section_buffer("AcDb:AcDbObjects", &info) {
+            let objects_buf = match cached_objects {
+                Some(objects) => Ok(objects),
+                None => self
+                    .get_section_buffer("AcDb:AcDbObjects", &info)
+                    .map(std::sync::Arc::new),
+            };
+            match objects_buf {
                 Ok(objects_buf) => {
                     objects_section_read = true;
-                    match crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader::with_encoding(
-                    objects_buf,
+                    match crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader::with_handle_map(
+                    std::sync::Arc::clone(&objects_buf),
                     dxf_version,
                     handle_map,
                     crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page),
                 ) {
                     Ok(mut obj_reader) => {
+                        if let Some(shard) =
+                            self.shard.as_mut().filter(|shard| shard.objects.is_none())
+                        {
+                            shard.plan_first(&mut obj_reader, objects_buf, handle_count, &document);
+                        } else {
+                            // The object reader holds the only other copy and
+                            // frees it once every record is decoded.
+                            drop(objects_buf);
+                        }
                         record_stream_read = true;
                         obj_reader.set_mesh_budget(self.options.mesh_budget());
                         let mut builder = crate::io::dwg::dwg_document_builder::DwgDocumentBuilder::new(obj_reader);
                         builder.set_failsafe(failsafe);
+                        builder.set_skip_roundtrip_data(self.options.skip_roundtrip_data);
                         if let Some(progress) = &self.progress {
                             builder.set_progress_callback(progress.clone());
                         }
@@ -1535,7 +1902,24 @@ impl<R: Read + Seek> DwgReader<R> {
         //    Store) section. Extract those blobs and attach them, in document
         //    order, to the modeler-geometry entities that arrived with only a
         //    stub. Files without an AcDs section keep their inline data.
-        if let Ok(acds_buf) = self.get_section_buffer("AcDb:AcDsPrototype_1b", &info) {
+        let acds_buf = match self.get_section_buffer("AcDb:AcDsPrototype_1b", &info) {
+            Ok(acds_buf) => Some(acds_buf),
+            Err(error) => {
+                // Many drawings have no AcDs section; one that has it but
+                // cannot be read loses every SAB blob.
+                if Self::find_section(&info, "AcDb:AcDsPrototype_1b").is_some() {
+                    self.notifications.notify(
+                        NotificationType::Warning,
+                        format!(
+                            "AcDs: section 'AcDb:AcDsPrototype_1b' not read, modeler entities keep no SAB data: {}",
+                            error
+                        ),
+                    );
+                }
+                None
+            }
+        };
+        if let Some(acds_buf) = acds_buf {
             // Authoritative: the `_data_` record table(s) bind each blob to its
             // owning handle. When present, attach by handle — the only mapping
             // that survives BIM exports whose blob/record/handle orders diverge.
@@ -1554,7 +1938,11 @@ impl<R: Read + Seek> DwgReader<R> {
                 .collect();
             let record_blobs = extract_acds_record_blobs(&acds_buf, &modeler_handles);
             let attached = if !record_blobs.is_empty() {
-                attach_acds_record_blobs(&mut document, record_blobs)
+                attach_acds_record_blobs(
+                    &mut document,
+                    record_blobs,
+                    self.options.defer_solid_reference_point,
+                )
             } else {
                 // No parseable record table: magic-scan the blobs and pair by
                 // the object-stream handle list, else positionally.
@@ -1562,7 +1950,11 @@ impl<R: Read + Seek> DwgReader<R> {
                 if blobs.is_empty() {
                     0
                 } else {
-                    attach_acds_sab_blobs(&mut document, blobs)
+                    attach_acds_sab_blobs(
+                        &mut document,
+                        blobs,
+                        self.options.defer_solid_reference_point,
+                    )
                 }
             };
             let fingerprint = super::sab_fingerprint(document.entities().filter_map(|entity| {
@@ -1981,6 +2373,25 @@ impl<R: Read + Seek> DwgReader<R> {
             }
         }
 
+        // CRC-16 of every byte before it follows the locator records.
+        if (0..=6).contains(&record_count) {
+            let crc_at = self.stream.stream_position()?;
+            let stored = self.stream.read_u16::<LittleEndian>()?;
+            self.stream.seek(SeekFrom::Start(0))?;
+            let mut bytes = vec![0u8; crc_at as usize];
+            self.stream.read_exact(&mut bytes)?;
+            self.stream.seek(SeekFrom::Start(crc_at + 2))?;
+            let computed = crate::io::dwg::crc::crc16(crate::io::dwg::crc::CRC16_SEED, &bytes);
+            if stored != computed {
+                let message = format!(
+                    "AC15 file header: CRC mismatch (stored {stored:#06X}, computed {computed:#06X})"
+                );
+                self.notifications
+                    .notify(NotificationType::Warning, message.clone());
+                self.report_section_diagnostic("checksum-mismatch", "FileHeader", Some(crc_at), message);
+            }
+        }
+
         // Calculate AcDbObjects position.
         //
         // AcDbObjects is not in the locator table. It occupies the gap between
@@ -2114,11 +2525,11 @@ impl<R: Read + Seek> DwgReader<R> {
         self.stream.seek(SeekFrom::Start(page_map_address))?;
 
         // Read 20-byte system page header (NOT XOR-masked)
-        let _section_type = self.stream.read_i32::<LittleEndian>()?;
+        let section_type = self.stream.read_i32::<LittleEndian>()?;
         let decomp_size = self.stream.read_i32::<LittleEndian>()?;
         let comp_size = self.stream.read_i32::<LittleEndian>()?;
         let compression = self.stream.read_i32::<LittleEndian>()?;
-        let _checksum = self.stream.read_u32::<LittleEndian>()?;
+        let checksum = self.stream.read_u32::<LittleEndian>()?;
 
         // Read compressed data
         if comp_size <= 0 || comp_size > 10_000_000 {
@@ -2142,6 +2553,11 @@ impl<R: Read + Seek> DwgReader<R> {
         self.charge_decompressed_bytes(output_size, "AC18 page map")?;
         let mut compressed = try_zeroed_vec(comp_size as usize, "AC18 page map compressed data")?;
         self.stream.read_exact(&mut compressed)?;
+        let computed = system_page_checksum(
+            [section_type, decomp_size as i32, comp_size, compression],
+            &compressed,
+        );
+        self.check_page_checksum("AC18 page map", Some(page_map_address), checksum, computed);
 
         // Decompress
         let decompressed = if compression == 2 {
@@ -2207,11 +2623,11 @@ impl<R: Read + Seek> DwgReader<R> {
         self.stream.seek(SeekFrom::Start(page_offset as u64))?;
 
         // Read 20-byte system page header (NOT XOR-masked)
-        let _section_type = self.stream.read_i32::<LittleEndian>()?;
+        let section_type = self.stream.read_i32::<LittleEndian>()?;
         let decomp_size = self.stream.read_i32::<LittleEndian>()?;
         let comp_size = self.stream.read_i32::<LittleEndian>()?;
         let compression = self.stream.read_i32::<LittleEndian>()?;
-        let _checksum = self.stream.read_u32::<LittleEndian>()?;
+        let checksum = self.stream.read_u32::<LittleEndian>()?;
 
         // Read compressed data
         if comp_size <= 0 || comp_size > 10_000_000 {
@@ -2236,6 +2652,11 @@ impl<R: Read + Seek> DwgReader<R> {
         let mut compressed =
             try_zeroed_vec(comp_size as usize, "AC18 section map compressed data")?;
         self.stream.read_exact(&mut compressed)?;
+        let computed = system_page_checksum(
+            [section_type, decomp_size as i32, comp_size, compression],
+            &compressed,
+        );
+        self.check_page_checksum("AC18 section map", Some(page_offset as u64), checksum, computed);
 
         // Decompress
         let decompressed = if compression == 2 {
@@ -2365,7 +2786,7 @@ impl<R: Read + Seek> DwgReader<R> {
         if compr_len < 0 {
             // Negative ComprLen means data is stored uncompressed (raw).
             // |ComprLen| = raw data length. Copy directly from offset 0x20.
-            let raw_len = (-compr_len) as usize;
+            let raw_len = compr_len.unsigned_abs() as usize;
             let src_start = 32; // offset 0x20 in decoded data
             let copy_len = raw_len
                 .min(0x110)
@@ -2680,6 +3101,7 @@ impl<R: Read + Seek> DwgReader<R> {
             block_size,
             compressed_size,
             uncompressed_size,
+            None,
         )
     }
 
@@ -2830,6 +3252,10 @@ impl<R: Read + Seek> DwgReader<R> {
                 DxfError::Parse(format!("Section '{}' not found in file", section_name))
             })?;
 
+        if section.encrypted != 0 && self.decryption_key.is_none() {
+            self.ensure_decryption_key(info)?;
+        }
+
         // Field 0x00 ("Data size") holds the total section data size.
         // Field 0x08 ("Max size") is the page partition size per spec §5.4.
         // We truncate to the total data size, not the page size.
@@ -2923,6 +3349,17 @@ impl<R: Read + Seek> DwgReader<R> {
                                 format_args!("AC21 page {}", page.page_number),
                             )?;
                             self.stream.read_exact(&mut bytes)?;
+                            if section.encrypted != 0 {
+                                if let Some(key) = &self.decryption_key {
+                                    let mut rc4 = crate::io::dwg::security::Rc4::new(key);
+                                    rc4.apply(&mut bytes);
+                                } else {
+                                    return Err(DxfError::Decryption(format!(
+                                        "Section '{}' is encrypted but no decryption key is available",
+                                        section_name
+                                    )));
+                                }
+                            }
                             Ok(bytes)
                         })();
                         match read {
@@ -2982,6 +3419,11 @@ impl<R: Read + Seek> DwgReader<R> {
                 });
             }
 
+            let key_ref = if section.encrypted != 0 {
+                self.decryption_key.as_deref()
+            } else {
+                None
+            };
             let decoded = map_ordered(prepared, |page| {
                 let data = match page.payload {
                     PagePayload::Ready(bytes) => Ok(bytes),
@@ -2998,6 +3440,7 @@ impl<R: Read + Seek> DwgReader<R> {
                         block_size,
                         compressed_size,
                         uncompressed_size,
+                        key_ref,
                     )
                     .map_err(|error| error.to_string()),
                     PagePayload::Failed(error) => Err(error),
@@ -3068,6 +3511,10 @@ impl<R: Read + Seek> DwgReader<R> {
                 DxfError::Parse(format!("Section '{}' not found in AC18 file", section_name))
             })?;
 
+        if section.encrypted != 0 && self.decryption_key.is_none() {
+            self.ensure_decryption_key(info)?;
+        }
+
         // compressed_size field actually holds the total uncompressed section data size
         let total_size = size_from_file(
             format_args!("AC18 section '{}' size", section_name),
@@ -3084,8 +3531,24 @@ impl<R: Read + Seek> DwgReader<R> {
         // corrupt header, while a large drawing legitimately spans many pages.
         // Count the page descriptors actually parsed: the declared count is file
         // data, and -1 reads as u64::MAX, which would lift this bound entirely.
+        // Pages of zeros are not stored, and each page is placed at its own
+        // offset with the gaps zero-filled, so a sparse section reaches as far
+        // as its furthest page. MAX_SECTION_SIZE and the decompressed budget
+        // still bound the allocation.
         let page_count = section.pages.len();
-        let page_capacity = page_count.saturating_mul(max_page_size);
+        let furthest_page_end = section
+            .pages
+            .iter()
+            .map(|page| {
+                usize::try_from(page.offset)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(max_page_size)
+            })
+            .max()
+            .unwrap_or(0);
+        let page_capacity = page_count
+            .saturating_mul(max_page_size)
+            .max(furthest_page_end);
         if total_size > page_capacity {
             // Some AC1032 writers include a small amount of section padding in the
             // declared size, beyond the sum of the parsed page capacities. Keep the
@@ -3120,7 +3583,7 @@ impl<R: Read + Seek> DwgReader<R> {
             let mut prepared = Vec::with_capacity(page_batch.len());
             for page in page_batch {
                 let page_number = page.page_number as i32;
-                let page_result = (|| -> Result<(usize, Vec<u8>), DxfError> {
+                let page_result = (|| -> Result<(usize, Vec<u8>, [u32; 4]), DxfError> {
                     let &(page_file_offset, _page_total_size) =
                         info.page_records.get(&page_number).ok_or_else(|| {
                             DxfError::Parse(format!(
@@ -3170,12 +3633,46 @@ impl<R: Read + Seek> DwgReader<R> {
                         format_args!("AC18 page {} compressed data", page_number),
                     )?;
                     self.stream.read_exact(&mut compressed)?;
+                    // Header checksum at 0x18 (its header with that field as
+                    // zero, seeded with the data checksum), data checksum at
+                    // 0x1C (the stored data, seed 0).
+                    let stored_header = u32::from_le_bytes(header[0x18..0x1C].try_into().unwrap());
+                    let stored_data = u32::from_le_bytes(header[0x1C..0x20].try_into().unwrap());
+                    let computed_data = adler32_checksum(0, &compressed);
+                    let mut zeroed = header;
+                    zeroed[0x18..0x1C].fill(0);
+                    let computed_header = adler32_checksum(stored_data, &zeroed);
+                    let checksums = [stored_header, computed_header, stored_data, computed_data];
+                    if section.encrypted != 0 {
+                        if let Some(key) = &self.decryption_key {
+                            let mut rc4 = crate::io::dwg::security::Rc4::new(key);
+                            rc4.apply(&mut compressed);
+                        } else {
+                            return Err(DxfError::Decryption(format!(
+                                "Section '{}' is encrypted but no decryption key is available",
+                                section_name
+                            )));
+                        }
+                    }
 
-                    Ok((data_offset as usize, compressed))
+                    Ok((data_offset as usize, compressed, checksums))
                 })();
 
                 match page_result {
-                    Ok(page) => prepared.push(page),
+                    Ok((offset, data, checksums)) => {
+                        // An encrypted page's checksums are not checked: what
+                        // they cover is not settled for that layout.
+                        if section.encrypted == 0 {
+                            let at = info
+                                .page_records
+                                .get(&page_number)
+                                .map(|&(offset, _)| offset as u64);
+                            let name = format!("AC18 section '{section_name}' page {page_number}");
+                            self.check_page_checksum(&name, at, checksums[0], checksums[1]);
+                            self.check_page_checksum(&name, at, checksums[2], checksums[3]);
+                        }
+                        prepared.push((offset, data));
+                    }
                     Err(error) if failsafe => {
                         skipped_pages += 1;
                         let page_offset = info
@@ -3431,10 +3928,47 @@ impl std::fmt::Display for CrcExtractionReport {
     }
 }
 
+/// The checksum of an AC18 system page (page map, section map): Adler-32 of
+/// its 20-byte header with the checksum field as zero, then of its data.
+fn system_page_checksum(header: [i32; 4], data: &[u8]) -> u32 {
+    let mut bytes = [0u8; 20];
+    for (slot, value) in bytes.chunks_exact_mut(4).zip(header) {
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+    adler32_checksum(adler32_checksum(0, &bytes), data)
+}
+
 #[cfg(test)]
 mod dwg_reader_tests {
-    use super::{extract_acds_record_blobs, section_name_from_field, ACIS_END_MARKER};
+    use super::{
+        extract_acds_record_blobs, find_acds_magic, find_subsequence, section_name_from_field,
+        ACIS_END_MARKER,
+    };
     use std::collections::HashSet;
+
+    #[test]
+    fn find_subsequence_starts_at_from() {
+        let hay = b"abcabcabc";
+        assert_eq!(find_subsequence(hay, b"abc", 0), Some(0));
+        assert_eq!(find_subsequence(hay, b"abc", 1), Some(3));
+        assert_eq!(find_subsequence(hay, b"abc", 6), Some(6));
+        assert_eq!(find_subsequence(hay, b"abc", 7), None);
+        assert_eq!(find_subsequence(hay, b"abc", 100), None);
+        assert_eq!(find_subsequence(hay, b"", 0), None);
+        assert_eq!(find_subsequence(b"ab", b"abc", 0), None);
+    }
+
+    #[test]
+    fn find_acds_magic_finds_either_magic_from_an_offset() {
+        let buf = b"xx ASM BinaryFile yy ACIS BinaryFile zz";
+        assert_eq!(find_acds_magic(buf, 0), Some(3));
+        assert_eq!(find_acds_magic(buf, 4), Some(21));
+        assert_eq!(find_acds_magic(buf, 22), None);
+        // A tail with neither magic in front of it is not a match.
+        assert_eq!(find_acds_magic(b"xx BinaryFile", 0), None);
+        // A magic that starts before `from` is not reported.
+        assert_eq!(find_acds_magic(b"ASM BinaryFile", 1), None);
+    }
 
     fn field(prefix: &[u8]) -> [u8; 64] {
         let mut b = [0u8; 64];
@@ -3464,6 +3998,162 @@ mod dwg_reader_tests {
     #[test]
     fn empty_when_first_byte_null() {
         assert_eq!(section_name_from_field(&[0u8; 64]), "");
+    }
+
+    use crate::entities::{Body, EntityType, Region, Solid3D};
+    use crate::types::{Transform, Vector3};
+
+    /// The SAB of a body whose two vertex points have the bounding-box centre
+    /// (2, 4, 6).
+    fn centred_sab() -> Vec<u8> {
+        use crate::entities::acis::{SabWriter, SatDocument};
+        let mut sat = SatDocument::new_body();
+        sat.add_point(0.0, 0.0, 0.0);
+        sat.add_point(4.0, 8.0, 12.0);
+        SabWriter::write(&sat)
+    }
+
+    const CENTRE: Vector3 = Vector3 {
+        x: 2.0,
+        y: 4.0,
+        z: 6.0,
+    };
+
+    /// A document with one solid, one region and one body (no anchor stored),
+    /// each given `centred_sab()` through the record-table attach path.
+    fn attached_modelers(
+        defer: bool,
+    ) -> (crate::document::CadDocument, [crate::Handle; 3]) {
+        let sab = centred_sab();
+        let mut document = crate::document::CadDocument::new();
+        let solid = document
+            .add_entity(EntityType::Solid3D(Solid3D::new()))
+            .unwrap();
+        let region = document
+            .add_entity(EntityType::Region(Region::new()))
+            .unwrap();
+        let body = document.add_entity(EntityType::Body(Body::new())).unwrap();
+        let handles = [solid, region, body];
+        let blobs = handles.iter().map(|h| (h.value(), sab.clone())).collect();
+        assert_eq!(
+            super::attach_acds_record_blobs(&mut document, blobs, defer),
+            3
+        );
+        (document, handles)
+    }
+
+    /// `(point_of_reference, reference_point_deferred, reference_point())` of
+    /// the solid, region and body.
+    fn reference_state(
+        document: &crate::document::CadDocument,
+        handles: &[crate::Handle; 3],
+    ) -> [(Vector3, bool, Vector3); 3] {
+        handles.map(|h| match document.get_entity(h) {
+            Some(EntityType::Solid3D(e)) => (
+                e.point_of_reference,
+                e.acis_data.reference_point_deferred,
+                e.reference_point(),
+            ),
+            Some(EntityType::Region(e)) => (
+                e.point_of_reference,
+                e.acis_data.reference_point_deferred,
+                e.reference_point(),
+            ),
+            Some(EntityType::Body(e)) => (
+                e.point_of_reference,
+                e.acis_data.reference_point_deferred,
+                e.reference_point(),
+            ),
+            other => panic!("expected a modeler entity, got {other:?}"),
+        })
+    }
+
+    #[test]
+    fn acds_attach_derives_the_reference_point_by_default() {
+        let (document, handles) = attached_modelers(false);
+        for (field, deferred, point) in reference_state(&document, &handles) {
+            assert_eq!(field, CENTRE);
+            assert!(!deferred);
+            assert_eq!(point, CENTRE);
+        }
+    }
+
+    #[test]
+    fn acds_attach_defers_the_reference_point_when_asked() {
+        let (document, handles) = attached_modelers(true);
+        for (field, deferred, point) in reference_state(&document, &handles) {
+            // The blob was stored but not parsed for a centre; asking derives it.
+            assert_eq!(field, Vector3::ZERO);
+            assert!(deferred);
+            assert_eq!(point, CENTRE);
+        }
+        match document.get_entity(handles[0]) {
+            Some(EntityType::Solid3D(e)) => assert_eq!(e.acis_data.sab_data, centred_sab()),
+            other => panic!("expected a solid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stored_anchor_wins_over_the_deferred_point() {
+        let mut document = crate::document::CadDocument::new();
+        let mut solid = Solid3D::new();
+        solid.point_of_reference = Vector3::new(1.0, 2.0, 3.0);
+        let handle = document.add_entity(EntityType::Solid3D(solid)).unwrap();
+        let blobs = vec![(handle.value(), centred_sab())];
+        assert_eq!(super::attach_acds_record_blobs(&mut document, blobs, true), 1);
+        match document.get_entity(handle) {
+            Some(EntityType::Solid3D(e)) => {
+                assert_eq!(e.point_of_reference, Vector3::new(1.0, 2.0, 3.0));
+                assert!(!e.acis_data.reference_point_deferred);
+                assert_eq!(e.reference_point(), Vector3::new(1.0, 2.0, 3.0));
+            }
+            other => panic!("expected a solid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moving_a_deferred_modeler_gives_the_moved_centre() {
+        use crate::entities::modification::{transform, translate};
+
+        fn close(a: Vector3, b: Vector3) {
+            assert!(
+                (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9 && (a.z - b.z).abs() < 1e-9,
+                "{a:?} != {b:?}"
+            );
+        }
+        fn apply(document: &mut crate::document::CadDocument, handle: crate::Handle, op: u8) {
+            let offset = Vector3::new(10.0, -3.0, 0.5);
+            let turn = Transform::from_rotation(Vector3::new(0.0, 0.0, 1.0), 0.5)
+                .then(&Transform::from_translation(offset));
+            match document.get_entity_mut(handle) {
+                Some(EntityType::Solid3D(e)) if op == 0 => translate::translate_solid3d(e, offset),
+                Some(EntityType::Solid3D(e)) => transform::transform_solid3d(e, &turn),
+                Some(EntityType::Region(e)) if op == 0 => translate::translate_region(e, offset),
+                Some(EntityType::Region(e)) => transform::transform_region(e, &turn),
+                Some(EntityType::Body(e)) if op == 0 => translate::translate_body(e, offset),
+                Some(EntityType::Body(e)) => transform::transform_body(e, &turn),
+                other => panic!("expected a modeler entity, got {other:?}"),
+            }
+        }
+
+        // op 0 translates, op 1 rotates then translates. The eager read is the
+        // reference: its field is the moved centre.
+        for op in [0u8, 1] {
+            let (mut eager, eager_handles) = attached_modelers(false);
+            let (mut deferred, deferred_handles) = attached_modelers(true);
+            for (e, d) in eager_handles.iter().zip(deferred_handles.iter()) {
+                apply(&mut eager, *e, op);
+                apply(&mut deferred, *d, op);
+            }
+            let want = reference_state(&eager, &eager_handles);
+            let got = reference_state(&deferred, &deferred_handles);
+            for ((want_field, _, _), (field, flag, point)) in want.into_iter().zip(got) {
+                assert_ne!(want_field, CENTRE);
+                assert!(!flag, "a moved entity is resolved");
+                close(field, want_field);
+                close(point, want_field);
+            }
+        }
     }
 
     #[test]
@@ -3526,6 +4216,155 @@ mod dwg_reader_tests {
                 expected,
             );
         }
+    }
+
+    /// Records whose bodies live in `blob01` pages hold a blob reference; each
+    /// is followed to its own pages, whatever order the pages are in, and an
+    /// unreferenced body elsewhere in the datastore (left by an earlier save)
+    /// attaches to nothing. Pairing the unclaimed bodies by count gave up on
+    /// every such record as soon as one stale body was present.
+    #[test]
+    fn acds_blob_references_follow_their_own_blob01_pages() {
+        const HEADER_SIZE: usize = 48;
+        const RECORD_SIZE: usize = 20;
+
+        fn body(label: &[u8]) -> Vec<u8> {
+            let mut value = b"ASM BinaryFile".to_vec();
+            value.extend_from_slice(label);
+            value.extend_from_slice(ACIS_END_MARKER);
+            value
+        }
+        fn put32(b: &mut Vec<u8>, v: u32) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put64(b: &mut Vec<u8>, v: u64) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        fn segment_header(b: &mut Vec<u8>, name: &[u8; 6], id: u32, is_blob: u32, size: u64) {
+            b.extend_from_slice(b"\xAC\xD5");
+            b.extend_from_slice(name);
+            put32(b, id);
+            put32(b, is_blob);
+            put64(b, size);
+            b.extend_from_slice(&[0; 16]);
+            b.extend_from_slice(&[0x55; 8]);
+        }
+        /// The record's in-table data: the reference to `pages` (id, size).
+        fn blob_ref(total: usize, pages: &[(u32, usize)]) -> Vec<u8> {
+            let mut r = Vec::new();
+            put32(&mut r, 0xBB10_6BB1);
+            put64(&mut r, total as u64);
+            put32(&mut r, pages.len() as u32);
+            put32(&mut r, 32 + 8 * pages.len() as u32);
+            put32(&mut r, pages[0].1 as u32);
+            put32(&mut r, pages[pages.len() - 1].1 as u32);
+            put32(&mut r, 0);
+            put32(&mut r, 0);
+            for (id, size) in pages {
+                put32(&mut r, *id);
+                put32(&mut r, *size as u32);
+            }
+            r
+        }
+        fn blob01(
+            b: &mut Vec<u8>,
+            id: u32,
+            total: usize,
+            start: usize,
+            index: u32,
+            count: u32,
+            data: &[u8],
+        ) {
+            segment_header(b, b"blob01", id, 1, HEADER_SIZE as u64);
+            put64(b, total as u64);
+            put64(b, start as u64);
+            put32(b, index);
+            put32(b, count);
+            put64(b, data.len() as u64);
+            b.extend_from_slice(data);
+        }
+
+        let inline = body(b"inline");
+        let one_page = body(b"one page");
+        let two_pages = body(b"two pages, split across both");
+        let stale = body(b"stale");
+        let split = 20;
+        let records: [(u32, Vec<u8>); 3] = [
+            (0xA1, blob_ref(one_page.len(), &[(30, one_page.len())])),
+            (0x91, inline.clone()),
+            (
+                0xA2,
+                blob_ref(
+                    two_pages.len(),
+                    &[(41, split), (42, two_pages.len() - split)],
+                ),
+            ),
+        ];
+
+        let table_size = RECORD_SIZE * records.len();
+        let data_size: usize = records.iter().map(|(_, d)| d.len()).sum();
+        let mut buffer = Vec::new();
+        segment_header(
+            &mut buffer,
+            b"_data_",
+            2,
+            0,
+            (HEADER_SIZE + table_size + data_size) as u64,
+        );
+        let mut offset = 0;
+        for (handle, data) in &records {
+            put32(&mut buffer, 0x14);
+            put32(&mut buffer, 1);
+            put64(&mut buffer, u64::from(*handle));
+            put32(&mut buffer, offset as u32);
+            offset += data.len();
+        }
+        for (_, data) in &records {
+            buffer.extend_from_slice(data);
+        }
+        // A body no record names, ahead of the pages: what an earlier save left.
+        segment_header(
+            &mut buffer,
+            b"search",
+            7,
+            0,
+            (HEADER_SIZE + stale.len()) as u64,
+        );
+        buffer.extend_from_slice(&stale);
+        // Pages out of record order: the two-page body first, then the one-page one.
+        blob01(
+            &mut buffer,
+            41,
+            two_pages.len(),
+            0,
+            0,
+            2,
+            &two_pages[..split],
+        );
+        blob01(
+            &mut buffer,
+            42,
+            two_pages.len(),
+            split,
+            1,
+            2,
+            &two_pages[split..],
+        );
+        blob01(&mut buffer, 30, one_page.len(), 0, 0, 1, &one_page);
+
+        let handles = HashSet::from([0x91u64, 0xA1, 0xA2]);
+        let extracted = extract_acds_record_blobs(&buffer, &handles);
+        let of = |handle: u64| {
+            extracted
+                .iter()
+                .find(|(candidate, _)| *candidate == handle)
+                .map(|(_, blob)| blob.clone())
+        };
+        assert_eq!(extracted.len(), 3);
+        assert_eq!(of(0x91), Some(inline));
+        assert_eq!(of(0xA1), Some(one_page));
+        assert_eq!(of(0xA2), Some(two_pages));
+        assert!(extracted.iter().all(|(_, blob)| *blob != stale));
     }
 }
 

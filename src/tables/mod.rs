@@ -171,6 +171,18 @@ impl<T: TableEntry> Table<T> {
 
     /// Get an entry by name (case-insensitive)
     pub fn get(&self, name: &str) -> Option<&T> {
+        // Hot path (her entity icin layer/linetype/block aramasi): kisa ASCII
+        // isimlerde String olusturmadan (heap allocation yok) buyuk harfe cevirip ara.
+        if name.len() <= 96 && name.is_ascii() {
+            let bytes = name.as_bytes();
+            let mut buf = [0u8; 96];
+            for (i, &c) in bytes.iter().enumerate() {
+                buf[i] = c.to_ascii_uppercase();
+            }
+            if let Ok(key) = std::str::from_utf8(&buf[..bytes.len()]) {
+                return self.entries.get(key);
+            }
+        }
         self.entries.get(&normalize_name(name))
     }
 
@@ -305,6 +317,15 @@ impl<T: TableEntry> Table<T> {
 impl<T: TableEntry> Default for Table<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: TableEntry> Table<T> {
+    pub(crate) fn reservation_fields(&self) {
+        let Self {
+            entries: _,
+            handle: _,
+        } = self;
     }
 }
 

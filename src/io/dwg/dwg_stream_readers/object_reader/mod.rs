@@ -31,6 +31,8 @@ use crate::types::{Color, DxfVersion, Transparency};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::handle_reader::HandleMap;
+
 /// Reject counts that cannot be represented by the remaining record bits.
 #[inline]
 fn safe_count(raw: i32, reader: &DwgMergedReader) -> i32 {
@@ -132,14 +134,14 @@ pub struct NonEntityCommonData {
 
 /// DWG Object Reader — iterates the object section by handle map.
 pub struct DwgObjectReader {
-    /// Raw object section data
-    data: Vec<u8>,
+    /// Raw object section data, shared by readers over the same section
+    data: Arc<Vec<u8>>,
     /// DWG version
     version: DwgVersion,
     /// DXF version
     dxf_version: DxfVersion,
     /// Handle → byte-offset map (from handle section)
-    handle_map: HashMap<u64, i64>,
+    handle_map: HandleMap,
     /// Document code page used by pre-R2007 object strings.
     encoding: crate::io::dxf::code_page::LegacyEncoding,
     /// Faces and face-corner indices retained from one MESH record.
@@ -159,11 +161,12 @@ impl DwgObjectReader {
     /// Create a new object reader.
     ///
     /// # Arguments
-    /// * `data` — Raw AcDb:AcDbObjects section data
+    /// * `data` — Raw AcDb:AcDbObjects section data. Pass an `Arc` to let
+    ///   several readers decode from one copy of the section.
     /// * `dxf_version` — DXF version for version-specific parsing
     /// * `handle_map` — Handle → file offset map from the handle section
     pub fn new(
-        data: Vec<u8>,
+        data: impl Into<Arc<Vec<u8>>>,
         dxf_version: DxfVersion,
         handle_map: HashMap<u64, i64>,
     ) -> Result<Self> {
@@ -171,14 +174,29 @@ impl DwgObjectReader {
     }
 
     pub fn with_encoding(
-        data: Vec<u8>,
+        data: impl Into<Arc<Vec<u8>>>,
         dxf_version: DxfVersion,
         handle_map: HashMap<u64, i64>,
         encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
     ) -> Result<Self> {
+        Self::with_handle_map(
+            data,
+            dxf_version,
+            handle_map.into_iter().collect(),
+            encoding,
+        )
+    }
+
+    /// [`Self::with_encoding`] with the map [`DwgReader`](crate::DwgReader) reads.
+    pub(crate) fn with_handle_map(
+        data: impl Into<Arc<Vec<u8>>>,
+        dxf_version: DxfVersion,
+        handle_map: HandleMap,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
+    ) -> Result<Self> {
         let version = DwgVersion::from_dxf_version(dxf_version)?;
         Ok(DwgObjectReader {
-            data,
+            data: data.into(),
             version,
             dxf_version,
             handle_map,
@@ -274,7 +292,7 @@ impl DwgObjectReader {
     }
 
     /// Decode an already captured merged record without adding file framing.
-    pub(crate) fn read_raw_record(
+    pub fn read_raw_record(
         &self,
         data: &[u8],
         handle_bits: i64,
@@ -819,6 +837,18 @@ impl DwgObjectReader {
     /// Get the byte offset for a given handle.
     pub fn offset_for(&self, handle: u64) -> Option<i64> {
         self.handle_map.get(&handle).copied()
+    }
+
+    /// Replace the handle map, keeping the object section.
+    pub(crate) fn set_handle_map(&mut self, handle_map: HandleMap) {
+        self.handle_map = handle_map;
+    }
+
+    /// Drop this reader's share of the object section and its handle map once
+    /// every record is decoded. Only the version accessors stay meaningful.
+    pub(crate) fn release_section(&mut self) {
+        self.data = Arc::default();
+        self.handle_map = HandleMap::default();
     }
 
     /// Get the DWG version.

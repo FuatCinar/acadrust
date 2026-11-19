@@ -22,6 +22,7 @@
 pub mod code_page;
 mod dxf_code;
 mod group_code_value;
+mod multiline_attributes;
 mod reader;
 mod spline_flags;
 mod writer;
@@ -29,6 +30,11 @@ mod writer;
 pub use dxf_code::DxfCode;
 pub use group_code_value::GroupCodeValueType;
 pub use reader::{DxfReader, DxfReaderConfiguration};
+// SADECE TEŞHİS AMAÇLI (bkz. reader/mem_checkpoint.rs) - parse sırasında
+// periyodik RSS/VmSize'i diske yazan yardımcı; lib.rs (Android JNI
+// katmanı) bunu load_or_get_cached() içinden çağırıyor.
+#[cfg(feature = "android")]
+pub(crate) use reader::mem_checkpoint;
 pub(crate) use reader::{DxfStreamReader, DxfTextReader};
 pub use writer::{value_type_for_code, write_binary_dxf, write_dxf};
 pub use writer::{

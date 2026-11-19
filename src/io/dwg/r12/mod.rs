@@ -1,4 +1,4 @@
-//! Native pre-R13 (AC1009/R11-R12) DWG support.
+//! Native pre-R13 (AC1009/R11-R12) DWG support, and reading of AC1006 (R10).
 
 pub mod entities;
 pub mod header;
@@ -25,9 +25,9 @@ use crate::io::dxf::{DxfReader, DxfStreamReader, DxfTextReader, DxfWriter};
 use crate::tables::{TableEntry, VxTableRecord};
 use crate::types::{DxfVersion, Handle};
 
-use self::entities::{decode_positioned_entities, encode_entities, EntityRecord, EntityTables};
+use self::entities::{decode_positioned_entities_for, encode_entities, EntityRecord, EntityTables};
 use self::header::{
-    write_auxheader, write_header, HeaderLayout, HeaderReferences, TableLocator,
+    write_auxheader, write_header, HeaderLayout, HeaderReferences, Revision, TableLocator,
     BLOCK_ENTITIES_BEGIN, BLOCK_ENTITIES_END, ENTITIES_BEGIN, ENTITIES_END, EXTRA_ENTITIES_BEGIN,
     EXTRA_ENTITIES_END,
 };
@@ -43,11 +43,31 @@ fn section_records(
     tables: &EntityTables,
     code_page: &str,
     preceding_table: Option<TableLocator>,
+    revision: Revision,
 ) -> Result<SectionRecords> {
     if content_size == 0 {
         return Ok(SectionRecords {
             base_address: field_start,
             ..SectionRecords::default()
+        });
+    }
+    if revision == Revision::R10 {
+        // R10 sections have no sentinels: the header addresses the records.
+        let section = usize::try_from(field_start)
+            .ok()
+            .zip(usize::try_from(content_size).ok())
+            .and_then(|(start, size)| data.get(start..start.checked_add(size)?))
+            .ok_or_else(|| DxfError::InvalidFormat("AC1006 section exceeds file bounds".into()))?;
+        return Ok(SectionRecords {
+            base_address: field_start,
+            size: content_size,
+            records: decode_positioned_entities_for(
+                section,
+                tables,
+                field_start,
+                code_page,
+                revision,
+            )?,
         });
     }
     let field_start = usize::try_from(field_start)
@@ -84,11 +104,12 @@ fn section_records(
             section.len()
         )));
     }
-    let records = decode_positioned_entities(
+    let records = decode_positioned_entities_for(
         &section[prelude..section.len() - 16],
         tables,
         field_start as u32,
         code_page,
+        revision,
     )?;
     Ok(SectionRecords {
         base_address: field_start as u32,
@@ -144,6 +165,17 @@ fn table_section_to_dxf(
 ) {
     out.push_str("0\nSECTION\n2\nTABLES\n");
     for (index, rows) in records.iter().enumerate() {
+        // A deleted entry (flag 128) keeps its slot so table indexes stay
+        // aligned, but it is no record of the drawing. BLOCK rows have lost
+        // group 70 by now (it means insertion units on a BLOCK_RECORD); a
+        // deleted one is unnamed.
+        let rows: Vec<&EntityRecord> = rows
+            .iter()
+            .filter(|row| match index {
+                0 => !row.string(2).is_empty(),
+                _ => row.integer(70, 0) & 128 == 0,
+            })
+            .collect();
         if rows.is_empty() {
             continue;
         }
@@ -218,14 +250,15 @@ pub(crate) fn read_document(
     code_page_override: Option<&str>,
 ) -> Result<CadDocument> {
     let header = header::read_header_with_code_page(data, code_page_override)?;
+    let revision = header.revision();
     let code_page = code_page_override.unwrap_or(header.variables.code_page.as_str());
-    let mut table_records = tables::decode_tables(data, &header.tables, code_page)?;
+    let mut table_records = tables::decode_tables_for(data, &header.tables, code_page, revision)?;
     let mut tables = ensure_table_defaults(tables::entity_tables(&table_records));
     // R11 dimension blocks share one table name (`*D`) while each BLOCK entity
     // carries the distinct name (`*D0`, `*D1`, …). Dimensions address the table
     // by index, so the shared name has to be replaced before those indexes are
     // turned into DXF names.
-    if header.layout.blocks_size != 0 {
+    let distinct_block_names = if header.layout.blocks_size != 0 {
         let preview = section_records(
             data,
             header.layout.blocks_start,
@@ -236,10 +269,15 @@ pub(crate) fn read_document(
             &tables,
             code_page,
             Some(header.tables[9]),
+            revision,
         )?;
-        adopt_distinct_block_names(&mut table_records[0], &preview, header.layout.blocks_start);
+        let names =
+            adopt_distinct_block_names(&mut table_records[0], &preview, header.layout.blocks_start);
         tables = ensure_table_defaults(tables::entity_tables(&table_records));
-    }
+        names
+    } else {
+        HashMap::new()
+    };
     let entities = section_records(
         data,
         header.layout.entities_start,
@@ -253,6 +291,7 @@ pub(crate) fn read_document(
         &tables,
         code_page,
         None,
+        revision,
     )?;
     let blocks = if header.layout.blocks_size != 0 {
         section_records(
@@ -265,6 +304,7 @@ pub(crate) fn read_document(
             &tables,
             code_page,
             Some(header.tables[9]),
+            revision,
         )?
     } else {
         SectionRecords {
@@ -283,6 +323,7 @@ pub(crate) fn read_document(
             &tables,
             code_page,
             None,
+            revision,
         )?
     } else {
         SectionRecords {
@@ -311,6 +352,13 @@ pub(crate) fn read_document(
         }
     }
     for block in blocks.iter_mut().filter(|record| record.kind == "BLOCK") {
+        if let Some(name) = block
+            .native_address
+            .and_then(|address| distinct_block_names.get(&address))
+        {
+            block.pairs.retain(|(code, _)| *code != 2);
+            block.pairs.push((2, name.clone()));
+        }
         if block.string(2).is_empty() {
             if let Some(table_record) = table_records[0].iter().find(|record| {
                 let offset = record.integer(90, 0) as u32 & 0x3fff_ffff;
@@ -386,6 +434,7 @@ pub(crate) fn read_document(
         table_name(1, header.references.layer_index).and_then(|name| document.layers.get(name))
     {
         document.header.current_layer_handle = layer.handle;
+        document.header.current_layer_name = layer.name.clone();
     }
     if let Some(style) = table_name(2, header.references.text_style_index)
         .and_then(|name| document.text_styles.get(name))
@@ -399,6 +448,7 @@ pub(crate) fn read_document(
     };
     if let Some(linetype) = linetype_name.and_then(|name| document.line_types.get(name)) {
         document.header.current_linetype_handle = linetype.handle;
+        document.header.current_linetype_name = linetype.name.clone();
     }
     if let Some(name) = table_name(5, header.references.ucs_index) {
         document.header.model_space_ucs_name = name.to_owned();
@@ -538,7 +588,7 @@ fn adopt_distinct_block_names(
     rows: &mut [EntityRecord],
     blocks: &SectionRecords,
     blocks_start: u32,
-) {
+) -> HashMap<u32, String> {
     // Only duplicated table names lose their index identity. A unique name
     // stays as stored so a differing BLOCK string cannot rename another block.
     let mut counts = std::collections::HashMap::<String, usize>::new();
@@ -551,7 +601,17 @@ fn adopt_distinct_block_names(
         .iter()
         .map(|row| row.string(2).to_ascii_uppercase())
         .collect();
-    for row in rows.iter_mut() {
+    // Generated names must not take a distinct BLOCK marker name that a later
+    // table row has not yet had a chance to adopt.
+    let marker_names: std::collections::HashSet<String> = blocks
+        .records
+        .iter()
+        .filter_map(|positioned| positioned.record.as_ref())
+        .filter(|record| record.kind == "BLOCK")
+        .map(|record| record.string(2).to_ascii_uppercase())
+        .collect();
+    let mut renamed = HashMap::new();
+    for (index, row) in rows.iter_mut().enumerate() {
         let current = row.string(2).to_ascii_uppercase();
         if counts.get(&current).copied().unwrap_or(0) < 2 {
             continue;
@@ -565,23 +625,33 @@ fn adopt_distinct_block_names(
             if positioned.address != address || record.kind != "BLOCK" {
                 return None;
             }
-            let name = record.string(2);
-            if name.is_empty() {
-                None
-            } else {
-                Some(name.to_owned())
-            }
+            Some(record.string(2).to_owned())
         }) else {
             continue;
         };
-        let claimed_name = name.to_ascii_uppercase();
-        if claimed_name == current || claimed.contains(&claimed_name) {
+        let name = if !name.is_empty() && !claimed.contains(&name.to_ascii_uppercase()) {
+            name
+        } else if row.integer(70, 0) & 1 != 0 && current.starts_with('*') {
+            // Some R12 writers store only an anonymous prefix in both places.
+            // The native table index still distinguishes the definitions.
+            let mut suffix = index;
+            loop {
+                let candidate = format!("{current}{suffix}");
+                if !claimed.contains(&candidate) && !marker_names.contains(&candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            }
+        } else {
             continue;
-        }
+        };
+        let claimed_name = name.to_ascii_uppercase();
         claimed.insert(claimed_name);
         row.pairs.retain(|(code, _)| *code != 2);
-        row.pairs.push((2, name));
+        row.pairs.push((2, name.clone()));
+        renamed.insert(address, name);
     }
+    renamed
 }
 
 fn records_reference_application(records: &DxfRecords, application: &str) -> bool {

@@ -23,13 +23,18 @@ pub fn read_data_object_data(
             for _ in 0..count(reader.read_bit_long(), reader) {
                 point_references.push(BreakPointReference {
                     version: reader.read_bit_short(),
-                    reserved: reader.read_bit() as i16,
+                    reserved: if reader.dxf_version() >= crate::types::DxfVersion::AC1027 {
+                        reader.read_bit_short()
+                    } else {
+                        reader.read_bit() as i16
+                    },
                     reference_type: reader.read_bit_long(),
                     flags: reader.read_bit_short(),
                     identifier: reader.read_bit_long(),
                     first_point: reader.read_3bit_double(),
                     second_point: reader.read_3bit_double(),
                     trailing_version: reader.read_bit_short(),
+                    ..BreakPointReference::default()
                 });
             }
             let dimension_reference = Handle::from(reader.read_handle());
